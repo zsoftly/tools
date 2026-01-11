@@ -206,12 +206,12 @@ case "$OS" in
 
         if [ -n "$AUTH_KEY" ]; then
             info "Using pre-auth key for registration..."
-            sudo tailscale up --login-server="$HEADSCALE_URL" --authkey="$AUTH_KEY" --accept-routes
+            sudo tailscale up --login-server="$HEADSCALE_URL" --authkey="$AUTH_KEY" --accept-routes --reset
         else
             info "A browser window will open for SSO authentication."
             warn "Note: Without a pre-auth key, an admin will need to assign tags to your device."
             echo ""
-            sudo tailscale up --login-server="$HEADSCALE_URL" --accept-routes
+            sudo tailscale up --login-server="$HEADSCALE_URL" --accept-routes --reset
         fi
 
         echo ""

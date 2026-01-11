@@ -148,14 +148,14 @@ if ([string]::IsNullOrEmpty($Key)) {
     Write-Warn "Note: Without a pre-auth key, an admin will need to assign tags to your device."
     Write-Host ""
     try {
-        & tailscale up --login-server=$HeadscaleUrl --accept-routes
+        & tailscale up --login-server=$HeadscaleUrl --accept-routes --reset
     } catch {
         Write-Err "Failed to connect: $_"
     }
 } else {
     Write-Info "Using pre-auth key for registration..."
     try {
-        & tailscale up --login-server=$HeadscaleUrl --authkey=$Key --accept-routes
+        & tailscale up --login-server=$HeadscaleUrl --authkey=$Key --accept-routes --reset
     } catch {
         Write-Err "Failed to connect: $_"
     }
