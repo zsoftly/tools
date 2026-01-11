@@ -1,0 +1,12 @@
+{
+  "name": "tools",
+  "version": "1.0.0",
+  "description": "Automation scripts with markdown formatting",
+  "scripts": {
+    "fmt": "prettier --write '**/*.md'",
+    "fmt:check": "prettier --check '**/*.md'"
+  },
+  "devDependencies": {
+    "prettier": "^3.3.0"
+  }
+}
