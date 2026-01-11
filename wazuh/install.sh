@@ -165,6 +165,14 @@ if [ -f "$OSSEC_CONF" ]; then
     sudo sed -i '' "s|<address>.*</address>|<address>${WAZUH_MANAGER}</address>|g" "$OSSEC_CONF"
 fi
 
+# Fix local_internal_options.conf if it has invalid XML content
+LOCAL_OPTS="/var/ossec/etc/local_internal_options.conf"
+if [ -f "$LOCAL_OPTS" ] && grep -q '<ossec_config>\|</ossec_config>' "$LOCAL_OPTS" 2>/dev/null; then
+    warn "Fixing invalid local_internal_options.conf (contains XML)"
+    echo "# Wazuh local internal options" | sudo tee "$LOCAL_OPTS" > /dev/null
+    echo "# Format: key=value" | sudo tee -a "$LOCAL_OPTS" > /dev/null
+fi
+
 # Check if already enrolled
 if [ -f /var/ossec/etc/client.keys ] && [ -s /var/ossec/etc/client.keys ]; then
     success "Agent is already enrolled"

@@ -97,6 +97,16 @@ if ($installed) {
     Write-Success "Wazuh agent installed"
 }
 
+# Fix local_internal_options.conf if it has invalid XML content
+$localInternalOptions = "$wazuhPath\local_internal_options.conf"
+if (Test-Path $localInternalOptions) {
+    $content = Get-Content $localInternalOptions -Raw -ErrorAction SilentlyContinue
+    if ($content -match '<ossec_config>|</ossec_config>') {
+        Write-Warn "Fixing invalid local_internal_options.conf (contains XML)"
+        Set-Content $localInternalOptions "# Wazuh local internal options`n# Format: key=value`n"
+    }
+}
+
 # Check if already enrolled
 $clientKeysPath = "$wazuhPath\client.keys"
 $enrolled = (Test-Path $clientKeysPath) -and ((Get-Item $clientKeysPath).Length -gt 0)
