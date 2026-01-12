@@ -11,13 +11,13 @@ Connect to a Headscale VPN server with a single command.
 ### macOS / Linux
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zsoftly/tools/main/vpn/install.sh | bash -s -- --server <SERVER_URL> --key <YOUR_KEY>
+curl -fsSL https://raw.githubusercontent.com/zsoftly/tools/main/vpn/install.sh | bash -s -- --server "SERVER_URL" --key "YOUR_KEY"
 ```
 
 ### Windows (PowerShell as Admin)
 
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/zsoftly/tools/main/vpn/install.ps1))) -Server <SERVER_URL> -Key <YOUR_KEY>
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/zsoftly/tools/main/vpn/install.ps1))) -Server "SERVER_URL" -Key "YOUR_KEY"
 ```
 
 ## Wazuh Agent Setup
@@ -30,34 +30,34 @@ Install the Wazuh security agent for endpoint monitoring.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/zsoftly/tools/main/wazuh/install.sh | bash -s -- \
-  --manager <MANAGER_ADDRESS> \
-  --group <AGENT_GROUP> \
-  --password <ENROLLMENT_PASSWORD>
+  --manager "MANAGER_ADDRESS" \
+  --group "AGENT_GROUP" \
+  --password "ENROLLMENT_PASSWORD"
 ```
 
 Interactive mode (will prompt for password):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/zsoftly/tools/main/wazuh/install.sh | bash -s -- \
-  --manager <MANAGER_ADDRESS> \
-  --group <AGENT_GROUP>
+  --manager "MANAGER_ADDRESS" \
+  --group "AGENT_GROUP"
 ```
 
 ### Windows (PowerShell as Admin)
 
 ```powershell
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/zsoftly/tools/main/wazuh/install.ps1))) `
-  -Manager <MANAGER_ADDRESS> `
-  -Group <AGENT_GROUP> `
-  -Password <ENROLLMENT_PASSWORD>
+  -Manager "MANAGER_ADDRESS" `
+  -Group "AGENT_GROUP" `
+  -Password "ENROLLMENT_PASSWORD"
 ```
 
 Interactive mode (will prompt for password):
 
 ```powershell
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/zsoftly/tools/main/wazuh/install.ps1))) `
-  -Manager <MANAGER_ADDRESS> `
-  -Group <AGENT_GROUP>
+  -Manager "MANAGER_ADDRESS" `
+  -Group "AGENT_GROUP"
 ```
 
 ## Available Tools
