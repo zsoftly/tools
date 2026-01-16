@@ -7,7 +7,7 @@ param(
     [string]$Manager,
     [string]$Group = "",
     [string]$Password = "",
-    [string]$Version = "4.14.1"
+    [string]$Version = ""  # Auto-detect latest if not specified
 )
 
 # Configuration
@@ -21,6 +21,18 @@ function Write-Info { param($msg) Write-Host "[INFO] $msg" -ForegroundColor Cyan
 function Write-Success { param($msg) Write-Host "[OK] $msg" -ForegroundColor Green }
 function Write-Warn { param($msg) Write-Host "[WARN] $msg" -ForegroundColor Yellow }
 function Write-Err { param($msg) Write-Host "[ERROR] $msg" -ForegroundColor Red; exit 1 }
+
+# Get latest Wazuh version from GitHub releases
+function Get-LatestWazuhVersion {
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/wazuh/wazuh/releases/latest" -UseBasicParsing
+        $version = $release.tag_name -replace '^v', ''
+        return $version
+    } catch {
+        return $null
+    }
+}
 
 # Prompt for password if not provided
 function Get-AuthPassword {
@@ -41,6 +53,16 @@ function Get-AuthPassword {
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
     Write-Err "This script must be run as Administrator. Right-click PowerShell and select 'Run as Administrator'."
+}
+
+# Auto-detect latest version if not specified
+if ([string]::IsNullOrEmpty($Version)) {
+    Write-Info "Detecting latest Wazuh version..."
+    $Version = Get-LatestWazuhVersion
+    if ([string]::IsNullOrEmpty($Version)) {
+        Write-Err "Failed to detect latest version. Specify with -Version parameter."
+    }
+    Write-Success "Using Wazuh v${Version}"
 }
 
 Write-Info "Wazuh Manager: $WazuhManager"

@@ -4,7 +4,7 @@
 set -e
 
 # Configuration
-WAZUH_VERSION="4.14.1-1"
+WAZUH_VERSION=""  # Auto-detect latest if not specified
 WAZUH_MANAGER="${WAZUH_MANAGER:-}"
 WAZUH_PORT="1514"
 WAZUH_ENROLLMENT_PORT="1515"
@@ -22,6 +22,22 @@ info() { echo -e "${CYAN}[INFO]${NC} $1"; }
 success() { echo -e "${GREEN}[OK]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
+
+# Get latest Wazuh version from GitHub releases
+get_latest_version() {
+    local version=""
+    # Try GitHub API first (most reliable)
+    if command -v curl &>/dev/null; then
+        version=$(curl -fsSL "https://api.github.com/repos/wazuh/wazuh/releases/latest" 2>/dev/null | \
+            grep -oP '"tag_name":\s*"v?\K[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    fi
+    # Fallback: scrape packages.wazuh.com for latest 4.x package
+    if [ -z "$version" ] && command -v curl &>/dev/null; then
+        version=$(curl -fsSL "https://packages.wazuh.com/4.x/apt/pool/main/w/wazuh-agent/" 2>/dev/null | \
+            grep -oP 'wazuh-agent_\K[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1)
+    fi
+    echo "$version"
+}
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -66,6 +82,16 @@ prompt_for_password() {
 # Validate required manager address
 if [ -z "$WAZUH_MANAGER" ]; then
     error "Manager address required. Use --manager <address> or set WAZUH_MANAGER environment variable."
+fi
+
+# Auto-detect latest version if not specified
+if [ -z "$WAZUH_VERSION" ]; then
+    info "Detecting latest Wazuh version..."
+    WAZUH_VERSION=$(get_latest_version)
+    if [ -z "$WAZUH_VERSION" ]; then
+        error "Failed to detect latest version. Specify with --version or -v flag."
+    fi
+    success "Using Wazuh v${WAZUH_VERSION}"
 fi
 
 # Detect OS and architecture
@@ -124,7 +150,7 @@ if [ "$INSTALLED" = false ]; then
 
                 info "Installing wazuh-agent..."
                 sudo apt-get update -qq
-                sudo apt-get install -y wazuh-agent="${WAZUH_VERSION}" || error "Failed to install package"
+                sudo apt-get install -y wazuh-agent="${WAZUH_VERSION}-1" || error "Failed to install package"
 
             elif [ -f /etc/redhat-release ]; then
                 # RHEL/CentOS/Fedora
@@ -142,7 +168,7 @@ protect=1
 EOF
 
                 info "Installing wazuh-agent..."
-                sudo yum install -y wazuh-agent-"${WAZUH_VERSION}" || error "Failed to install package"
+                sudo yum install -y wazuh-agent-"${WAZUH_VERSION}-1" || error "Failed to install package"
             else
                 error "Unsupported Linux distribution. Install manually from https://documentation.wazuh.com"
             fi
