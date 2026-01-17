@@ -10,6 +10,7 @@ WAZUH_PORT="1514"
 WAZUH_ENROLLMENT_PORT="1515"
 AGENT_GROUP="${WAZUH_AGENT_GROUP:-}"
 AUTH_PASSWORD=""
+ENABLE_REMOTE_COMMANDS="${WAZUH_REMOTE_COMMANDS:-false}"  # Remote commands from manager (disabled by default)
 
 # Colors for output
 RED='\033[0;31m'
@@ -27,14 +28,17 @@ error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 get_latest_version() {
     local version=""
     # Try GitHub API first (most reliable)
+    # Use sed instead of grep -oP for macOS compatibility
     if command -v curl &>/dev/null; then
         version=$(curl -fsSL "https://api.github.com/repos/wazuh/wazuh/releases/latest" 2>/dev/null | \
-            grep -oP '"tag_name":\s*"v?\K[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+            sed -n 's/.*"tag_name":[[:space:]]*"v\{0,1\}\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)".*/\1/p' | head -1)
     fi
     # Fallback: scrape packages.wazuh.com for latest 4.x package
     if [ -z "$version" ] && command -v curl &>/dev/null; then
+        # Use awk to create numeric sortable key (avoids non-POSIX sort -V)
         version=$(curl -fsSL "https://packages.wazuh.com/4.x/apt/pool/main/w/wazuh-agent/" 2>/dev/null | \
-            grep -oP 'wazuh-agent_\K[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1)
+            sed -n 's/.*wazuh-agent_\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | \
+            awk -F. '{ printf "%d%06d%06d %s\n", $1, $2, $3, $0 }' | sort -n | tail -1 | awk '{ print $2 }')
     fi
     echo "$version"
 }
@@ -58,8 +62,20 @@ while [[ $# -gt 0 ]]; do
             WAZUH_VERSION="$2"
             shift 2
             ;;
-        *)
+        --enable-remote-commands)
+            ENABLE_REMOTE_COMMANDS="true"
             shift
+            ;;
+        --no-remote-commands)
+            ENABLE_REMOTE_COMMANDS="false"
+            shift
+            ;;
+        -h|--help)
+            echo "Usage: $0 --manager <address> [--group <group>] [--password <password>] [--version <version>] [--enable-remote-commands]"
+            exit 0
+            ;;
+        *)
+            error "Unknown argument: $1. Use --help for usage."
             ;;
     esac
 done
@@ -186,9 +202,11 @@ info "Configuring manager address..."
 OSSEC_CONF="/var/ossec/etc/ossec.conf"
 
 if [ -f "$OSSEC_CONF" ]; then
+    # Escape special sed characters in WAZUH_MANAGER (& | / \)
+    WAZUH_MANAGER_ESCAPED=$(printf '%s' "$WAZUH_MANAGER" | sed 's/[&/|\\]/\\&/g')
     # Update manager address in config
-    sudo sed -i.bak "s|<address>.*</address>|<address>${WAZUH_MANAGER}</address>|g" "$OSSEC_CONF" 2>/dev/null || \
-    sudo sed -i '' "s|<address>.*</address>|<address>${WAZUH_MANAGER}</address>|g" "$OSSEC_CONF"
+    sudo sed -i.bak "s|<address>.*</address>|<address>${WAZUH_MANAGER_ESCAPED}</address>|g" "$OSSEC_CONF" 2>/dev/null || \
+    sudo sed -i '' "s|<address>.*</address>|<address>${WAZUH_MANAGER_ESCAPED}</address>|g" "$OSSEC_CONF"
 fi
 
 # Fix local_internal_options.conf if it has invalid XML content
@@ -210,14 +228,33 @@ else
 
     if [ -z "$AUTH_PASSWORD" ]; then
         warn "No password provided. Agent will not be enrolled automatically."
-        warn "Enroll manually: sudo /var/ossec/bin/agent-auth -m $WAZUH_MANAGER"
+        warn "Enroll manually: sudo /var/ossec/bin/agent-auth -m \"$WAZUH_MANAGER\""
     else
         info "Enrolling agent with manager..."
-        ENROLL_CMD="sudo /var/ossec/bin/agent-auth -m $WAZUH_MANAGER -p $WAZUH_ENROLLMENT_PORT"
-        [ -n "$AGENT_GROUP" ] && ENROLL_CMD="$ENROLL_CMD -G $AGENT_GROUP"
-        ENROLL_CMD="$ENROLL_CMD -P $AUTH_PASSWORD"
-        eval "$ENROLL_CMD" || error "Enrollment failed. Check password and network connectivity."
+        # Use Wazuh's authd.pass file to avoid password exposure in process list
+        AUTHD_PASS_FILE="/var/ossec/etc/authd.pass"
+        sudo sh -c "echo '$AUTH_PASSWORD' > '$AUTHD_PASS_FILE' && chmod 600 '$AUTHD_PASS_FILE'"
+
+        # Build enrollment arguments as array to avoid shell injection
+        ENROLL_ARGS=(-m "$WAZUH_MANAGER" -p "$WAZUH_ENROLLMENT_PORT")
+        [ -n "$AGENT_GROUP" ] && ENROLL_ARGS+=(-G "$AGENT_GROUP")
+
+        # agent-auth reads password from authd.pass automatically
+        if ! sudo /var/ossec/bin/agent-auth "${ENROLL_ARGS[@]}"; then
+            sudo rm -f "$AUTHD_PASS_FILE"
+            error "Enrollment failed. Check password and network connectivity."
+        fi
+        sudo rm -f "$AUTHD_PASS_FILE"
         success "Agent enrolled"
+    fi
+fi
+
+# Configure remote commands
+if [ "$ENABLE_REMOTE_COMMANDS" = "true" ]; then
+    info "Enabling remote commands from manager..."
+    LOCAL_OPTS="/var/ossec/etc/local_internal_options.conf"
+    if ! grep -q "^wazuh.remote_commands=1" "$LOCAL_OPTS" 2>/dev/null; then
+        echo "wazuh.remote_commands=1" | sudo tee -a "$LOCAL_OPTS" > /dev/null
     fi
 fi
 
@@ -244,8 +281,9 @@ sleep 3
 
 if sudo /var/ossec/bin/wazuh-control status 2>/dev/null | grep -q "is running"; then
     success "Wazuh agent is running"
-    # Check connection in logs (informational only)
-    if grep -q "Connected to the server" /var/ossec/logs/ossec.log 2>/dev/null; then
+    # Check connection in logs (informational only, check rotated logs too)
+    LOG_DIR="/var/ossec/logs"
+    if [ -d "$LOG_DIR" ] && sudo grep -q "Connected to the server" "$LOG_DIR"/ossec.log* 2>/dev/null; then
         success "Connected to Wazuh manager!"
     else
         info "Agent running. Connection to manager may take a few seconds..."
