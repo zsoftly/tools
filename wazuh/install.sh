@@ -24,6 +24,49 @@ success() { echo -e "${GREEN}[OK]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
+# Check if wazuh agent is running (uses exit code, not grep pattern)
+is_agent_running() {
+    sudo /var/ossec/bin/wazuh-control status >/dev/null 2>&1
+}
+
+# macOS: Check and request Full Disk Access
+check_macos_full_disk_access() {
+    [ "$(uname -s)" != "Darwin" ] && return 0
+
+    # Check if wazuh-agentd has FDA by testing access to a TCC-protected path
+    # /Library/Application Support/com.apple.TCC is only readable with FDA
+    if ! sudo test -r "/Library/Application Support/com.apple.TCC/TCC.db" 2>/dev/null; then
+        echo ""
+        echo "============================================================"
+        echo "  FULL DISK ACCESS REQUIRED"
+        echo "============================================================"
+        echo ""
+        echo "Wazuh needs Full Disk Access to monitor protected files."
+        echo ""
+        echo "Opening System Settings..."
+        echo ""
+        echo "Please:"
+        echo "  1. Click the + button"
+        echo "  2. Navigate to /Library/Ossec/bin/"
+        echo "  3. Add 'wazuh-agentd'"
+        echo "  4. Press Enter here when done"
+        echo ""
+
+        # Open System Settings to Full Disk Access pane
+        open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles" 2>/dev/null || \
+        open "/System/Library/PreferencePanes/Security.prefPane" 2>/dev/null || true
+
+        read -rp "Press Enter after granting Full Disk Access... "
+
+        # Restart agent to apply FDA
+        info "Restarting agent to apply permissions..."
+        sudo /var/ossec/bin/wazuh-control restart 2>/dev/null || true
+        success "Full Disk Access configured"
+    else
+        success "Full Disk Access already granted"
+    fi
+}
+
 # Get latest Wazuh version from GitHub releases
 get_latest_version() {
     local version=""
@@ -279,28 +322,66 @@ else
     fi
 fi
 
-# Start service
-info "Starting Wazuh agent service..."
-case "$OS" in
-    Darwin)
-        sudo /var/ossec/bin/wazuh-control start
-        ;;
-    Linux)
-        if command -v systemctl &>/dev/null; then
-            sudo systemctl daemon-reload
-            sudo systemctl enable wazuh-agent
-            sudo systemctl start wazuh-agent
-        else
-            sudo /var/ossec/bin/wazuh-control start
+# Start service with clean state
+start_wazuh_agent() {
+    local max_retries=2
+    local retry=0
+
+    while [[ $retry -lt $max_retries ]]; do
+        # Stop any existing processes first (ignore errors if not running)
+        sudo /var/ossec/bin/wazuh-control stop 2>/dev/null || true
+
+        # Clean up stale PID files (common issue on macOS)
+        if [ -d /var/ossec/var/run ]; then
+            sudo rm -f /var/ossec/var/run/*.pid 2>/dev/null || true
         fi
-        ;;
-esac
+
+        # Kill any orphaned wazuh processes (use specific names to avoid killing unrelated processes)
+        sudo pkill -9 wazuh-agentd wazuh-execd wazuh-modulesd wazuh-syscheckd wazuh-logcollector 2>/dev/null || true
+        sleep 1
+
+        # Start fresh
+        case "$OS" in
+            Darwin)
+                sudo /var/ossec/bin/wazuh-control start
+                ;;
+            Linux)
+                if command -v systemctl &>/dev/null; then
+                    sudo systemctl daemon-reload
+                    sudo systemctl enable wazuh-agent
+                    sudo systemctl start wazuh-agent
+                else
+                    sudo /var/ossec/bin/wazuh-control start
+                fi
+                ;;
+        esac
+
+        # Verify it started
+        sleep 2
+        if is_agent_running; then
+            return 0
+        fi
+
+        retry=$((retry + 1))
+        if [[ $retry -lt $max_retries ]]; then
+            warn "Agent failed to start, retrying ($retry/$max_retries)..."
+            sleep 2
+        fi
+    done
+
+    return 1
+}
+
+info "Starting Wazuh agent service..."
+if ! start_wazuh_agent; then
+    warn "Agent may not have started properly. See troubleshooting below."
+fi
 
 # Verify agent status
 info "Verifying agent status..."
 sleep 3
 
-if sudo /var/ossec/bin/wazuh-control status 2>/dev/null | grep -q "is running"; then
+if is_agent_running; then
     success "Wazuh agent is running"
     # Check connection in logs (informational only, check rotated logs too)
     LOG_DIR="/var/ossec/logs"
@@ -313,6 +394,9 @@ else
     warn "Agent may not be running. Check: sudo /var/ossec/bin/wazuh-control status"
 fi
 
+# macOS: Check/request Full Disk Access
+check_macos_full_disk_access
+
 echo ""
 success "Wazuh agent setup complete!"
 echo ""
@@ -321,3 +405,18 @@ echo "  Status:  sudo /var/ossec/bin/wazuh-control status"
 echo "  Logs:    sudo tail -f /var/ossec/logs/ossec.log"
 echo "  Restart: sudo /var/ossec/bin/wazuh-control restart"
 echo ""
+
+# Show troubleshooting link if agent isn't running
+if ! is_agent_running; then
+    echo ""
+    warn "Agent may not be running. Quick fix:"
+    echo ""
+    echo "  sudo /var/ossec/bin/wazuh-control stop"
+    echo "  sudo rm -f /var/ossec/var/run/*.pid"
+    echo "  sudo pkill -9 wazuh-agentd wazuh-execd wazuh-modulesd wazuh-syscheckd wazuh-logcollector"
+    echo "  sudo /var/ossec/bin/wazuh-control start"
+    echo ""
+    echo "For more help, see:"
+    echo "  https://github.com/ZSoftly/platform/blob/main/docs/dev-environment-setup.md#troubleshooting-wazuh-agent"
+    echo ""
+fi
