@@ -29,12 +29,12 @@ get_latest_version() {
     # Try GitHub API first (most reliable)
     if command -v curl &>/dev/null; then
         version=$(curl -fsSL "https://api.github.com/repos/wazuh/wazuh/releases/latest" 2>/dev/null | \
-            grep -oP '"tag_name":\s*"v?\K[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+            sed -n 's/.*"tag_name": *"v\{0,1\}\([0-9]*\.[0-9]*\.[0-9]*\)".*/\1/p' | head -1)
     fi
     # Fallback: scrape packages.wazuh.com for latest 4.x package
     if [ -z "$version" ] && command -v curl &>/dev/null; then
         version=$(curl -fsSL "https://packages.wazuh.com/4.x/apt/pool/main/w/wazuh-agent/" 2>/dev/null | \
-            grep -oP 'wazuh-agent_\K[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1)
+            sed -n 's/.*wazuh-agent_\([0-9]*\.[0-9]*\.[0-9]*\).*/\1/p' | sort -V | tail -1)
     fi
     echo "$version"
 }
@@ -122,14 +122,20 @@ if [ "$INSTALLED" = false ]; then
             fi
 
             info "Downloading Wazuh agent for macOS ($PKG_ARCH)..."
-            PKG_URL="https://packages.wazuh.com/4.x/macos/wazuh-agent-${WAZUH_VERSION}.${PKG_ARCH}.pkg"
-            TMP_PKG=$(mktemp /tmp/wazuh-agent-XXXXXX.pkg)
+            PKG_URL="https://packages.wazuh.com/4.x/macos/wazuh-agent-${WAZUH_VERSION}-1.${PKG_ARCH}.pkg"
+            TMP_PKG="/tmp/wazuh-agent-$$.pkg"
+            rm -f "$TMP_PKG"  # Ensure clean state
 
             curl -fsSL "$PKG_URL" -o "$TMP_PKG" || error "Failed to download package"
 
             info "Installing package..."
             sudo installer -pkg "$TMP_PKG" -target / || error "Failed to install package"
             rm -f "$TMP_PKG"
+
+            # Create symlink for /var/ossec -> /Library/Ossec (macOS uses /Library/Ossec)
+            if [ ! -e /var/ossec ]; then
+                sudo ln -sf /Library/Ossec /var/ossec
+            fi
             ;;
         Linux)
             # Linux - detect distro
@@ -185,22 +191,30 @@ fi
 info "Configuring manager address..."
 OSSEC_CONF="/var/ossec/etc/ossec.conf"
 
-if [ -f "$OSSEC_CONF" ]; then
-    # Update manager address in config
-    sudo sed -i.bak "s|<address>.*</address>|<address>${WAZUH_MANAGER}</address>|g" "$OSSEC_CONF" 2>/dev/null || \
-    sudo sed -i '' "s|<address>.*</address>|<address>${WAZUH_MANAGER}</address>|g" "$OSSEC_CONF"
+# Use sudo test since /var/ossec/etc may have restricted permissions on macOS
+if sudo test -f "$OSSEC_CONF"; then
+    # Update manager address in config (handle both BSD and GNU sed)
+    if [ "$OS" = "Darwin" ]; then
+        sudo sed -i '' "s|<address>.*</address>|<address>${WAZUH_MANAGER}</address>|g" "$OSSEC_CONF"
+        sudo sed -i '' "s|MANAGER_IP|${WAZUH_MANAGER}|g" "$OSSEC_CONF"
+    else
+        sudo sed -i "s|<address>.*</address>|<address>${WAZUH_MANAGER}</address>|g" "$OSSEC_CONF"
+        sudo sed -i "s|MANAGER_IP|${WAZUH_MANAGER}|g" "$OSSEC_CONF"
+    fi
+else
+    warn "Config file not found at $OSSEC_CONF"
 fi
 
 # Fix local_internal_options.conf if it has invalid XML content
 LOCAL_OPTS="/var/ossec/etc/local_internal_options.conf"
-if [ -f "$LOCAL_OPTS" ] && grep -q '<ossec_config>\|</ossec_config>' "$LOCAL_OPTS" 2>/dev/null; then
+if sudo test -f "$LOCAL_OPTS" && sudo grep -q '<ossec_config>\|</ossec_config>' "$LOCAL_OPTS" 2>/dev/null; then
     warn "Fixing invalid local_internal_options.conf (contains XML)"
     echo "# Wazuh local internal options" | sudo tee "$LOCAL_OPTS" > /dev/null
     echo "# Format: key=value" | sudo tee -a "$LOCAL_OPTS" > /dev/null
 fi
 
 # Check if already enrolled
-if [ -f /var/ossec/etc/client.keys ] && [ -s /var/ossec/etc/client.keys ]; then
+if sudo test -f /var/ossec/etc/client.keys && sudo test -s /var/ossec/etc/client.keys; then
     success "Agent is already enrolled"
 else
     # Prompt for password if not provided
