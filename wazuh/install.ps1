@@ -173,12 +173,19 @@ if ($enrolled) {
 }
 
 # Configure remote commands
+$localOpts = "$wazuhPath\local_internal_options.conf"
+$content = if (Test-Path $localOpts) { Get-Content $localOpts -Raw -ErrorAction SilentlyContinue } else { "" }
 if ($RemoteCommandsEnabled) {
     Write-Info "Enabling remote commands from manager..."
-    $localOpts = "$wazuhPath\local_internal_options.conf"
-    $content = if (Test-Path $localOpts) { Get-Content $localOpts -Raw -ErrorAction SilentlyContinue } else { "" }
     if ($content -notmatch "wazuh\.remote_commands=1") {
         Add-Content -Path $localOpts -Value "wazuh.remote_commands=1"
+    }
+} else {
+    # Remove remote commands setting if present
+    if ($content -match "wazuh\.remote_commands=1") {
+        Write-Info "Disabling remote commands from manager..."
+        $newContent = ($content -split "`n" | Where-Object { $_ -notmatch "^wazuh\.remote_commands=1" }) -join "`n"
+        Set-Content -Path $localOpts -Value $newContent -NoNewline
     }
 }
 

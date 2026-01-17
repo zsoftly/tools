@@ -250,11 +250,18 @@ else
 fi
 
 # Configure remote commands
+LOCAL_OPTS="/var/ossec/etc/local_internal_options.conf"
 if [ "$ENABLE_REMOTE_COMMANDS" = "true" ]; then
     info "Enabling remote commands from manager..."
-    LOCAL_OPTS="/var/ossec/etc/local_internal_options.conf"
     if ! grep -q "^wazuh.remote_commands=1" "$LOCAL_OPTS" 2>/dev/null; then
         echo "wazuh.remote_commands=1" | sudo tee -a "$LOCAL_OPTS" > /dev/null
+    fi
+else
+    # Remove remote commands setting if present
+    if grep -q "^wazuh.remote_commands=1" "$LOCAL_OPTS" 2>/dev/null; then
+        info "Disabling remote commands from manager..."
+        sudo sed -i.bak '/^wazuh.remote_commands=1/d' "$LOCAL_OPTS" 2>/dev/null || \
+        sudo sed -i '' '/^wazuh.remote_commands=1/d' "$LOCAL_OPTS"
     fi
 fi
 
