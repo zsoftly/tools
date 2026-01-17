@@ -7,7 +7,8 @@ param(
     [string]$Manager,
     [string]$Group = "",
     [string]$Password = "",
-    [string]$Version = ""  # Auto-detect latest if not specified
+    [string]$Version = "",  # Auto-detect latest if not specified
+    [switch]$EnableRemoteCommands  # Enable remote commands from manager (disabled by default)
 )
 
 # Configuration
@@ -16,6 +17,7 @@ $AgentGroup = $Group
 $WazuhPort = "1514"
 $WazuhEnrollmentPort = "1515"
 $ErrorActionPreference = "Stop"
+$RemoteCommandsEnabled = if ($EnableRemoteCommands) { $true } elseif ($env:WAZUH_REMOTE_COMMANDS) { $env:WAZUH_REMOTE_COMMANDS -eq "true" } else { $false }
 
 function Write-Info { param($msg) Write-Host "[INFO] $msg" -ForegroundColor Cyan }
 function Write-Success { param($msg) Write-Host "[OK] $msg" -ForegroundColor Green }
@@ -167,6 +169,23 @@ if ($enrolled) {
         } else {
             Write-Warn "agent-auth.exe not found. Enroll manually."
         }
+    }
+}
+
+# Configure remote commands
+$localOpts = "$wazuhPath\local_internal_options.conf"
+$content = if (Test-Path $localOpts) { Get-Content $localOpts -Raw -ErrorAction SilentlyContinue } else { "" }
+if ($RemoteCommandsEnabled) {
+    Write-Info "Enabling remote commands from manager..."
+    if ($content -notmatch "wazuh\.remote_commands=1") {
+        Add-Content -Path $localOpts -Value "wazuh.remote_commands=1"
+    }
+} else {
+    # Remove remote commands setting if present
+    if ($content -match "wazuh\.remote_commands=1") {
+        Write-Info "Disabling remote commands from manager..."
+        $newContent = ($content -split "`n" | Where-Object { $_ -notmatch "^wazuh\.remote_commands=1" }) -join "`n"
+        Set-Content -Path $localOpts -Value $newContent -NoNewline
     }
 }
 

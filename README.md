@@ -35,13 +35,13 @@ curl -fsSL https://raw.githubusercontent.com/zsoftly/tools/main/wazuh/install.sh
   --password "ENROLLMENT_PASSWORD"
 ```
 
-Interactive mode (will prompt for password):
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/zsoftly/tools/main/wazuh/install.sh | bash -s -- \
-  --manager "MANAGER_ADDRESS" \
-  --group "AGENT_GROUP"
-```
+| Option                     | Environment Variable         | Description                              |
+| -------------------------- | ---------------------------- | ---------------------------------------- |
+| `--manager`                | `WAZUH_MANAGER`              | Manager address (required)               |
+| `--group`                  | `WAZUH_AGENT_GROUP`          | Agent group                              |
+| `--password`               | -                            | Enrollment password (prompts if omitted) |
+| `--version`                | -                            | Wazuh version (auto-detects if omitted)  |
+| `--enable-remote-commands` | `WAZUH_REMOTE_COMMANDS=true` | Allow manager to run commands on agent   |
 
 ### Windows (PowerShell as Admin)
 
@@ -52,13 +52,13 @@ curl -fsSL https://raw.githubusercontent.com/zsoftly/tools/main/wazuh/install.sh
   -Password "ENROLLMENT_PASSWORD"
 ```
 
-Interactive mode (will prompt for password):
-
-```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/zsoftly/tools/main/wazuh/install.ps1))) `
-  -Manager "MANAGER_ADDRESS" `
-  -Group "AGENT_GROUP"
-```
+| Option                  | Environment Variable         | Description                              |
+| ----------------------- | ---------------------------- | ---------------------------------------- |
+| `-Manager`              | -                            | Manager address (required)               |
+| `-Group`                | -                            | Agent group                              |
+| `-Password`             | -                            | Enrollment password (prompts if omitted) |
+| `-Version`              | -                            | Wazuh version (auto-detects if omitted)  |
+| `-EnableRemoteCommands` | `WAZUH_REMOTE_COMMANDS=true` | Allow manager to run commands on agent   |
 
 ## Available Tools
 
