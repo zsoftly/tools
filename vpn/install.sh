@@ -1,12 +1,20 @@
 #!/bin/bash
 # Headscale VPN Setup Script - macOS/Linux
-# Usage: ./install.sh --server <url> [--key <authkey>]
+# Usage: HEADSCALE_URL=https://your-headscale-server ./install.sh [firstname.lastname]
+#
+# Required environment variable:
+#   HEADSCALE_URL  - URL of your Headscale server
 set -e
 
 # Configuration
 MAX_DAEMON_WAIT_SECONDS=30
-HEADSCALE_URL="${HEADSCALE_URL:-}"
-AUTH_KEY=""
+FULL_NAME=""
+
+if [ -z "${HEADSCALE_URL:-}" ]; then
+    echo "[ERROR] HEADSCALE_URL environment variable is required."
+    echo "  Export it before running: export HEADSCALE_URL=https://your-headscale-server"
+    exit 1
+fi
 
 # Colors for output
 RED='\033[0;31m'
@@ -23,24 +31,41 @@ error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --server|-s)
-            HEADSCALE_URL="$2"
-            shift 2
-            ;;
-        --key|-k)
-            AUTH_KEY="$2"
+        --user|-u)
+            FULL_NAME="$2"
             shift 2
             ;;
         *)
+            # Accept positional firstname.lastname argument
+            if [[ -z "$FULL_NAME" && "$1" != -* ]]; then
+                FULL_NAME="$1"
+            fi
             shift
             ;;
     esac
 done
 
-# Validate required server URL
-if [ -z "$HEADSCALE_URL" ]; then
-    error "Server URL required. Use --server <url> or set HEADSCALE_URL environment variable."
+# Prompt for firstname.lastname if not provided
+if [ -z "$FULL_NAME" ]; then
+    echo ""
+    read -p "Enter your name (firstname.lastname, e.g. john.doe): " FULL_NAME
+    echo ""
+    if [ -z "$FULL_NAME" ]; then
+        error "Name is required to set the device hostname."
+    fi
 fi
+
+# Detect OS and architecture
+OS="$(uname -s)"
+ARCH="$(uname -m)"
+
+case "$OS" in
+    Darwin) HOSTNAME="${FULL_NAME}-mac" ;;
+    Linux)  HOSTNAME="${FULL_NAME}-linux" ;;
+    *)      HOSTNAME="${FULL_NAME}-device" ;;
+esac
+
+info "Detected OS: $OS ($ARCH)"
 
 # macOS requires GUI steps - show instructions and confirm
 macos_setup_instructions() {
@@ -61,21 +86,10 @@ macos_setup_instructions() {
     echo "  - Click 'Enable CLI'"
     echo ""
     echo "STEP 3: Connect to VPN"
-    if [ -n "$AUTH_KEY" ]; then
-        echo "  - Hold OPTION key and click the Tailscale menu bar icon"
-        echo "  - Click 'Log in to a different tailnet...'"
-        echo "  - Enter: $HEADSCALE_URL"
-        echo "  - When prompted for auth key, enter:"
-        echo "    $AUTH_KEY"
-    else
-        echo "  - Hold OPTION key and click the Tailscale menu bar icon"
-        echo "  - Click 'Log in to a different tailnet...'"
-        echo "  - Enter: $HEADSCALE_URL"
-        echo "  - Sign in with your Google Workspace account"
-        echo ""
-        echo "  OR if you have a pre-auth key:"
-        echo "  - Use CLI: tailscale up --login-server=$HEADSCALE_URL --authkey <KEY>"
-    fi
+    echo "  - Hold OPTION key and click the Tailscale menu bar icon"
+    echo "  - Click 'Log in to a different tailnet...'"
+    echo "  - Enter: $HEADSCALE_URL"
+    echo "  - A browser window will open — log in with your company SSO credentials via Authentik."
     echo ""
     echo "STEP 4: Verify"
     echo "  - Click menu bar icon - should show 'Connected'"
@@ -90,28 +104,6 @@ macos_setup_instructions() {
     fi
     echo ""
 }
-
-# Prompt for auth key if not provided
-prompt_for_key() {
-    echo ""
-    echo "============================================================"
-    echo "  PRE-AUTH KEY"
-    echo "============================================================"
-    echo ""
-    echo "You need a pre-auth key from your IT admin to connect."
-    echo "The key determines your access level and network permissions."
-    echo ""
-    echo "If you don't have a key, you can still connect via SSO (browser)"
-    echo "but you'll have no access until an admin assigns tags."
-    echo ""
-    read -p "Enter pre-auth key (or press Enter to use SSO): " AUTH_KEY
-    echo ""
-}
-
-# Detect OS and architecture
-OS="$(uname -s)"
-ARCH="$(uname -m)"
-info "Detected OS: $OS ($ARCH)"
 
 # Check if Tailscale is actually installed and working
 tailscale_installed=false
@@ -195,34 +187,18 @@ case "$OS" in
             sleep 1
         done
 
-        # Prompt for key if not provided
-        if [ -z "$AUTH_KEY" ]; then
-            prompt_for_key
-        fi
-
-        # Connect to Headscale
+        # Connect to Headscale via OIDC
         echo ""
-        info "Connecting to VPN..."
+        info "Connecting to VPN (hostname: $HOSTNAME)..."
+        sudo tailscale up --login-server="$HEADSCALE_URL" --hostname="$HOSTNAME" --accept-routes --reset
 
-        if [ -n "$AUTH_KEY" ]; then
-            info "Using pre-auth key for registration..."
-            sudo tailscale up --login-server="$HEADSCALE_URL" --authkey="$AUTH_KEY" --accept-routes --reset
-        else
-            info "A browser window will open for SSO authentication."
-            warn "Note: Without a pre-auth key, an admin will need to assign tags to your device."
-            echo ""
-            sudo tailscale up --login-server="$HEADSCALE_URL" --accept-routes --reset
-        fi
-
+        echo ""
+        info "A browser window will open — log in with your company SSO credentials via Authentik."
         echo ""
         success "VPN setup complete!"
         echo ""
         echo "Verify connection with: tailscale status"
         echo "Your VPN IP: $(tailscale ip -4 2>/dev/null || echo 'pending...')"
         echo ""
-
-        if [ -z "$AUTH_KEY" ]; then
-            warn "Reminder: Ask your admin to assign appropriate tags to your device."
-        fi
         ;;
 esac
