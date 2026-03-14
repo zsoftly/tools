@@ -1,5 +1,5 @@
 # Headscale VPN Setup Script - Windows
-# Usage: .\install.ps1 [[-User] firstname.lastname]
+# Usage: .\install.ps1 [[-User] john.d] [-Key AUTH_KEY]
 # Run as Administrator for best results
 #
 # Required environment variable:
@@ -8,7 +8,8 @@
 
 param(
     [Parameter(Position=0)]
-    [string]$User = ""
+    [string]$User = "",
+    [string]$Key = ""
 )
 
 # Configuration
@@ -27,10 +28,10 @@ function Write-Success { param($msg) Write-Host "[OK] $msg" -ForegroundColor Gre
 function Write-Warn { param($msg) Write-Host "[WARN] $msg" -ForegroundColor Yellow }
 function Write-Err { param($msg) Write-Host "[ERROR] $msg" -ForegroundColor Red; exit 1 }
 
-# Prompt for firstname.lastname if not provided
+# Prompt for name if not provided
 if ([string]::IsNullOrEmpty($User)) {
     Write-Host ""
-    $User = Read-Host "Enter your name (firstname.lastname, e.g. john.doe)"
+    $User = Read-Host "Enter your name (e.g. john.d)"
     Write-Host ""
 }
 
@@ -137,18 +138,21 @@ if ($attempts -ge $MAX_SERVICE_WAIT_ATTEMPTS) {
     Write-Warn "Tailscale service may not be ready. Continuing anyway..."
 }
 
-# Connect to Headscale via OIDC
+# Connect to Headscale
 Write-Host ""
 Write-Info "Connecting to VPN (hostname: $Hostname)..."
 
 try {
-    & tailscale up --login-server=$HeadscaleUrl --hostname=$Hostname --accept-routes --reset
+    if (-not [string]::IsNullOrEmpty($Key)) {
+        & tailscale up --login-server=$HeadscaleUrl --hostname=$Hostname --authkey=$Key --accept-routes --reset
+    } else {
+        & tailscale up --login-server=$HeadscaleUrl --hostname=$Hostname --accept-routes --reset
+        Write-Host ""
+        Write-Info "A browser window will open — log in with your company SSO credentials via Authentik."
+    }
 } catch {
     Write-Err "Failed to connect: $_"
 }
-
-Write-Host ""
-Write-Info "A browser window will open — log in with your company SSO credentials via Authentik."
 Write-Host ""
 Write-Success "VPN setup complete!"
 Write-Host ""

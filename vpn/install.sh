@@ -1,6 +1,6 @@
 #!/bin/bash
 # Headscale VPN Setup Script - macOS/Linux
-# Usage: HEADSCALE_URL=https://your-headscale-server ./install.sh [firstname.lastname]
+# Usage: HEADSCALE_URL=https://your-headscale-server ./install.sh [john.d] [--key AUTH_KEY]
 #
 # Required environment variable:
 #   HEADSCALE_URL  - URL of your Headscale server
@@ -9,6 +9,7 @@ set -e
 # Configuration
 MAX_DAEMON_WAIT_SECONDS=30
 FULL_NAME=""
+AUTH_KEY=""
 
 if [ -z "${HEADSCALE_URL:-}" ]; then
     echo "[ERROR] HEADSCALE_URL environment variable is required."
@@ -35,8 +36,12 @@ while [[ $# -gt 0 ]]; do
             FULL_NAME="$2"
             shift 2
             ;;
+        --key|-k)
+            AUTH_KEY="$2"
+            shift 2
+            ;;
         *)
-            # Accept positional firstname.lastname argument
+            # Accept positional name argument (e.g. john.d)
             if [[ -z "$FULL_NAME" && "$1" != -* ]]; then
                 FULL_NAME="$1"
             fi
@@ -45,10 +50,10 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Prompt for firstname.lastname if not provided
+# Prompt for name if not provided
 if [ -z "$FULL_NAME" ]; then
     echo ""
-    read -p "Enter your name (firstname.lastname, e.g. john.doe): " FULL_NAME
+    read -p "Enter your name (e.g. john.d): " FULL_NAME
     echo ""
     if [ -z "$FULL_NAME" ]; then
         error "Name is required to set the device hostname."
@@ -187,13 +192,17 @@ case "$OS" in
             sleep 1
         done
 
-        # Connect to Headscale via OIDC
+        # Connect to Headscale
         echo ""
         info "Connecting to VPN (hostname: $HOSTNAME)..."
-        sudo tailscale up --login-server="$HEADSCALE_URL" --hostname="$HOSTNAME" --accept-routes --reset
 
-        echo ""
-        info "A browser window will open — log in with your company SSO credentials via Authentik."
+        if [ -n "$AUTH_KEY" ]; then
+            sudo tailscale up --login-server="$HEADSCALE_URL" --hostname="$HOSTNAME" --authkey="$AUTH_KEY" --accept-routes --reset
+        else
+            sudo tailscale up --login-server="$HEADSCALE_URL" --hostname="$HOSTNAME" --accept-routes --reset
+            echo ""
+            info "A browser window will open — log in with your company SSO credentials via Authentik."
+        fi
         echo ""
         success "VPN setup complete!"
         echo ""
