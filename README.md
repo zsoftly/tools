@@ -45,13 +45,17 @@ Connect to a Headscale VPN server with a single command.
 ### macOS / Linux
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zsoftly/tools/main/vpn/install.sh | bash -s -- --server "SERVER_URL" --key "YOUR_KEY"
+curl -fsSL https://raw.githubusercontent.com/zsoftly/tools/main/vpn/install.sh | bash -s -- --server "SERVER_URL" --user "YOUR_NAME" --key "YOUR_KEY"
 ```
+
+`HEADSCALE_URL="SERVER_URL"` is also supported for automation, but `--server` is the preferred onboarding form.
+
+**macOS note:** the script now attempts real enrollment, not just installation. macOS may still require a one-time network extension approval in **System Settings > Privacy & Security** before the script can finish connecting the Mac.
 
 ### Windows (PowerShell as Admin)
 
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/zsoftly/tools/main/vpn/install.ps1))) -Server "SERVER_URL" -Key "YOUR_KEY"
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/zsoftly/tools/main/vpn/install.ps1))) -Server "SERVER_URL" -User "YOUR_NAME" -Key "YOUR_KEY"
 ```
 
 ## Wazuh Agent Setup
