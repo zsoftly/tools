@@ -1,15 +1,16 @@
 #!/bin/bash
 # Headscale VPN Setup Script - macOS/Linux
-# Usage: ./install.sh --server https://your-headscale-server --user john.d [--key AUTH_KEY]
+# Usage: HEADSCALE_URL=https://your-headscale-server ./install.sh [john.d] [--key AUTH_KEY]
 #
 # Server URL input:
-#   --server|-s     Preferred
-#   HEADSCALE_URL   Fallback for automation
+#   HEADSCALE_URL   Preferred
+#   --server|-s     Optional override
 set -e
 
 # Configuration
 MAX_DAEMON_WAIT_SECONDS=30
 MAX_MACOS_READY_WAIT_SECONDS=60
+MAX_MACOS_CONNECT_RETRY_SECONDS=15
 FULL_NAME=""
 AUTH_KEY=""
 SERVER_URL=""
@@ -31,6 +32,9 @@ error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 while [[ $# -gt 0 ]]; do
     case $1 in
         --server|-s)
+            if [[ -z "${2:-}" || "$2" == -* ]]; then
+                error "--server requires a URL value. Usage: HEADSCALE_URL=https://your-headscale-server ./install.sh [john.d] [--key AUTH_KEY]"
+            fi
             SERVER_URL="$2"
             shift 2
             ;;
@@ -244,7 +248,16 @@ case "$OS" in
             info "If prompted, complete the browser SSO flow via Authentik."
         fi
 
-        if ! verify_macos_connection; then
+        connected=false
+        for i in $(seq 1 "$MAX_MACOS_CONNECT_RETRY_SECONDS"); do
+            if verify_macos_connection; then
+                connected=true
+                break
+            fi
+            sleep 1
+        done
+
+        if [ "$connected" = false ]; then
             error "Tailscale app is installed, but this Mac is not connected yet. If macOS showed a system extension approval prompt, approve it and re-run the same command."
         fi
 

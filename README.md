@@ -45,10 +45,11 @@ Connect to a Headscale VPN server with a single command.
 ### macOS / Linux
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zsoftly/tools/main/vpn/install.sh | bash -s -- --server "SERVER_URL" --user "YOUR_NAME" --key "YOUR_KEY"
+HEADSCALE_URL="SERVER_URL" \
+  bash <(curl -fsSL https://raw.githubusercontent.com/zsoftly/tools/main/vpn/install.sh) "YOUR_NAME" --key "YOUR_KEY"
 ```
 
-`HEADSCALE_URL="SERVER_URL"` is also supported for automation, but `--server` is the preferred onboarding form.
+`--server "SERVER_URL"` is also supported when you need an explicit CLI flag, but the standard onboarding form uses `HEADSCALE_URL`.
 
 **macOS note:** the script now attempts real enrollment, not just installation. macOS may still require a one-time network extension approval in **System Settings > Privacy & Security** before the script can finish connecting the Mac.
 
