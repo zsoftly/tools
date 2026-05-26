@@ -39,10 +39,16 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --user|-u)
+            if [[ -z "${2:-}" || "$2" == -* ]]; then
+                error "--user requires a name value. Usage: HEADSCALE_URL=https://your-headscale-server ./install.sh [john.d] [--key AUTH_KEY]"
+            fi
             FULL_NAME="$2"
             shift 2
             ;;
         --key|-k)
+            if [[ -z "${2:-}" || "$2" == -* ]]; then
+                error "--key requires an auth key value."
+            fi
             AUTH_KEY="$2"
             shift 2
             ;;
