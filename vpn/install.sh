@@ -2,20 +2,19 @@
 # Headscale VPN Setup Script - macOS/Linux
 # Usage: HEADSCALE_URL=https://your-headscale-server ./install.sh [john.d] [--key AUTH_KEY]
 #
-# Required environment variable:
-#   HEADSCALE_URL  - URL of your Headscale server
+# Server URL input:
+#   HEADSCALE_URL   Preferred
+#   --server|-s     Optional override
 set -e
 
 # Configuration
 MAX_DAEMON_WAIT_SECONDS=30
+MAX_MACOS_READY_WAIT_SECONDS=60
+MAX_MACOS_CONNECT_RETRY_SECONDS=15
 FULL_NAME=""
 AUTH_KEY=""
-
-if [ -z "${HEADSCALE_URL:-}" ]; then
-    echo "[ERROR] HEADSCALE_URL environment variable is required."
-    echo "  Export it before running: export HEADSCALE_URL=https://your-headscale-server"
-    exit 1
-fi
+SERVER_URL=""
+TAILSCALE_CLI=""
 
 # Colors for output
 RED='\033[0;31m'
@@ -32,11 +31,24 @@ error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --server|-s)
+            if [[ -z "${2:-}" || "$2" == -* ]]; then
+                error "--server requires a URL value. Usage: HEADSCALE_URL=https://your-headscale-server ./install.sh [john.d] [--key AUTH_KEY]"
+            fi
+            SERVER_URL="$2"
+            shift 2
+            ;;
         --user|-u)
+            if [[ -z "${2:-}" || "$2" == -* ]]; then
+                error "--user requires a name value. Usage: HEADSCALE_URL=https://your-headscale-server ./install.sh [john.d] [--key AUTH_KEY]"
+            fi
             FULL_NAME="$2"
             shift 2
             ;;
         --key|-k)
+            if [[ -z "${2:-}" || "$2" == -* ]]; then
+                error "--key requires an auth key value."
+            fi
             AUTH_KEY="$2"
             shift 2
             ;;
@@ -49,6 +61,17 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [ -n "$SERVER_URL" ]; then
+    HEADSCALE_URL="$SERVER_URL"
+fi
+
+if [ -z "${HEADSCALE_URL:-}" ]; then
+    echo "[ERROR] Headscale server URL is required."
+    echo "  Use --server https://your-headscale-server"
+    echo "  Or export HEADSCALE_URL=https://your-headscale-server"
+    exit 1
+fi
 
 # Prompt for name if not provided
 if [ -z "$FULL_NAME" ]; then
@@ -72,33 +95,31 @@ esac
 
 info "Detected OS: $OS ($ARCH)"
 
-# macOS requires GUI steps - show instructions and confirm
+# macOS requires at least one approval step before the app can register
 macos_setup_instructions() {
     echo ""
     echo "============================================================"
     echo "  macOS SETUP INSTRUCTIONS"
     echo "============================================================"
     echo ""
-    echo "macOS requires GUI steps to complete setup. Please read carefully:"
+    echo "macOS may require one manual approval step before VPN enrollment can finish."
     echo ""
     echo "STEP 1: Allow Network Extension"
     echo "  - Follow the prompt to allow Tailscale network extension"
     echo "  - Or go to System Settings > Privacy & Security > scroll down > click 'Allow'"
     echo ""
-    echo "STEP 2: Enable CLI (optional but recommended)"
-    echo "  - Click Tailscale menu bar icon > Settings"
-    echo "  - Go to 'CLI' tab"
-    echo "  - Click 'Enable CLI'"
+    echo "STEP 2: Wait while this script finishes enrollment"
+    echo "  - The script will open Tailscale and try to register this Mac automatically"
+    echo "  - Headscale server: $HEADSCALE_URL"
+    if [ -n "$AUTH_KEY" ]; then
+        echo "  - Auth key mode: enabled"
+    else
+        echo "  - Auth key mode: not provided, browser SSO may open"
+    fi
     echo ""
-    echo "STEP 3: Connect to VPN"
-    echo "  - Hold OPTION key and click the Tailscale menu bar icon"
-    echo "  - Click 'Log in to a different tailnet...'"
-    echo "  - Enter: $HEADSCALE_URL"
-    echo "  - A browser window will open — log in with your company SSO credentials via Authentik."
-    echo ""
-    echo "STEP 4: Verify"
-    echo "  - Click menu bar icon - should show 'Connected'"
-    echo "  - If CLI enabled: tailscale status"
+    echo "STEP 3: Verify"
+    echo "  - The script will report success only after the Mac is actually connected"
+    echo "  - If it reports a macOS approval block, approve the extension and re-run the same command"
     echo ""
     echo "============================================================"
     echo ""
@@ -110,18 +131,65 @@ macos_setup_instructions() {
     echo ""
 }
 
+find_macos_cli() {
+    local candidates=(
+        "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+        "/Applications/Tailscale.app/Contents/MacOS/tailscale"
+    )
+    local candidate
+    for candidate in "${candidates[@]}"; do
+        if [ -x "$candidate" ]; then
+            TAILSCALE_CLI="$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+macos_tailscale() {
+    TAILSCALE_BE_CLI=1 "$TAILSCALE_CLI" "$@"
+}
+
+wait_for_macos_cli_ready() {
+    local i
+    local status_output
+    for i in $(seq 1 "$MAX_MACOS_READY_WAIT_SECONDS"); do
+        if status_output=$(macos_tailscale status 2>&1); then
+            return 0
+        fi
+        if echo "$status_output" | grep -Eq "Logged out|Stopped|NeedsLogin"; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+verify_macos_connection() {
+    local backend_state
+    backend_state=$(macos_tailscale status --json 2>/dev/null | awk -F'"' '/"BackendState"/ {print $4; exit}')
+    [ "$backend_state" = "Running" ]
+}
+
 # Check if Tailscale is actually installed and working
 tailscale_installed=false
-if command -v tailscale &>/dev/null; then
-    # Verify it actually works (not a stale wrapper)
-    if tailscale version &>/dev/null 2>&1; then
+if [ "$OS" = "Darwin" ]; then
+    if find_macos_cli; then
         tailscale_installed=true
         success "Tailscale is already installed"
-    else
-        info "Found broken tailscale installation, reinstalling..."
-        # Clean up stale wrappers
-        sudo rm -f /usr/local/bin/tailscale 2>/dev/null || true
-        rm -f /opt/homebrew/bin/tailscale 2>/dev/null || true
+    fi
+else
+    if command -v tailscale &>/dev/null; then
+        # Verify it actually works (not a stale wrapper)
+        if tailscale version &>/dev/null 2>&1; then
+            tailscale_installed=true
+            success "Tailscale is already installed"
+        else
+            info "Found broken tailscale installation, reinstalling..."
+            # Clean up stale wrappers
+            sudo rm -f /usr/local/bin/tailscale 2>/dev/null || true
+            rm -f /opt/homebrew/bin/tailscale 2>/dev/null || true
+        fi
     fi
 fi
 
@@ -158,16 +226,53 @@ fi
 # OS-specific setup
 case "$OS" in
     Darwin)
-        # macOS requires GUI setup - show instructions and get confirmation first
+        if ! find_macos_cli; then
+            error "Tailscale was installed but the macOS app CLI was not found under /Applications/Tailscale.app."
+        fi
+
         macos_setup_instructions
 
         info "Opening Tailscale app..."
         open -a Tailscale 2>/dev/null || true
 
+        info "Waiting for Tailscale on macOS to become ready..."
+        if ! wait_for_macos_cli_ready; then
+            error "Tailscale on macOS is not ready yet. Approve the network extension in System Settings > Privacy & Security, then re-run the same command."
+        fi
+
         echo ""
-        success "Tailscale app opened. Follow the steps above to complete setup."
+        info "Connecting to VPN (hostname: $HOSTNAME)..."
+        if [ -n "$AUTH_KEY" ]; then
+            if ! macos_tailscale up --login-server="$HEADSCALE_URL" --hostname="$HOSTNAME" --authkey="$AUTH_KEY" --accept-routes --reset; then
+                error "Tailscale could not complete macOS enrollment. If macOS showed a system extension approval prompt, approve it and re-run the same command."
+            fi
+        else
+            if ! macos_tailscale up --login-server="$HEADSCALE_URL" --hostname="$HOSTNAME" --accept-routes --reset; then
+                error "Tailscale did not complete macOS login. Finish any browser SSO or macOS approval prompts, then re-run the same command."
+            fi
+            echo ""
+            info "If prompted, complete the browser SSO flow via Authentik."
+        fi
+
+        connected=false
+        for i in $(seq 1 "$MAX_MACOS_CONNECT_RETRY_SECONDS"); do
+            if verify_macos_connection; then
+                connected=true
+                break
+            fi
+            sleep 1
+        done
+
+        if [ "$connected" = false ]; then
+            error "Tailscale app is installed, but this Mac is not connected yet. If macOS showed a system extension approval prompt, approve it and re-run the same command."
+        fi
+
         echo ""
-        exit 0
+        success "VPN setup complete!"
+        echo ""
+        echo "Verify connection with: TAILSCALE_BE_CLI=1 \"$TAILSCALE_CLI\" status"
+        echo "Your VPN IP: $(macos_tailscale ip -4 2>/dev/null || echo 'pending...')"
+        echo ""
         ;;
     Linux)
         # Linux - use systemd
