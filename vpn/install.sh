@@ -53,7 +53,7 @@ done
 # Prompt for name if not provided
 if [ -z "$FULL_NAME" ]; then
     echo ""
-    read -p "Enter your name (e.g. john.d): " FULL_NAME
+    read -r -p "Enter your name (e.g. john-d): " FULL_NAME
     echo ""
     if [ -z "$FULL_NAME" ]; then
         error "Name is required to set the device hostname."
@@ -65,10 +65,29 @@ OS="$(uname -s)"
 ARCH="$(uname -m)"
 
 case "$OS" in
-    Darwin) HOSTNAME="${FULL_NAME}-mac" ;;
-    Linux)  HOSTNAME="${FULL_NAME}-linux" ;;
-    *)      HOSTNAME="${FULL_NAME}-device" ;;
+    Darwin) SUFFIX="-mac" ;;
+    Linux)  SUFFIX="-lin" ;;
+    *)      SUFFIX="-device" ;;
 esac
+
+# Headscale requires the node name to be a valid DNS label: lower case, only
+# letters, digits and dashes, no leading or trailing dash, 63 characters max.
+# Anything else makes it log "breaks map generation" and drop the node from
+# map responses. Lower case the name, replace every character outside
+# [a-z0-9-] with a dash, collapse runs, then trim to leave room for the suffix.
+DNS_LABEL_MAX=63
+SAFE_NAME="$(printf '%s' "$FULL_NAME" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed -E 's/-+/-/g; s/^-|-$//g')"
+SAFE_NAME="$(printf '%s' "$SAFE_NAME" | cut -c "1-$((DNS_LABEL_MAX - ${#SUFFIX}))" | sed -E 's/-$//')"
+
+if [ -z "$SAFE_NAME" ]; then
+    error "Name must contain at least one letter or digit."
+fi
+
+HOSTNAME="${SAFE_NAME}${SUFFIX}"
+
+if [ "$SAFE_NAME" != "$FULL_NAME" ]; then
+    info "Device name normalised to '$SAFE_NAME' (lower case, only letters, digits and dashes, ${DNS_LABEL_MAX} characters max including the '${SUFFIX}' suffix)."
+fi
 
 info "Detected OS: $OS ($ARCH)"
 

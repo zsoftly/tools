@@ -39,7 +39,30 @@ if ([string]::IsNullOrEmpty($User)) {
     Write-Err "Name is required to set the device hostname."
 }
 
-$Hostname = "$User-win"
+# Headscale requires the node name to be a valid DNS label: lower case, only
+# letters, digits and dashes, no leading or trailing dash, 63 characters max.
+# Anything else makes it log "breaks map generation" and drop the node from
+# map responses. Lower case the name, replace every character outside
+# [a-z0-9-] with a dash, collapse runs, then trim to leave room for the suffix.
+$DnsLabelMax = 63
+$Suffix = "-win"
+$SafeUser = ($User.ToLower() -replace '[^a-z0-9-]', '-') -replace '-+', '-'
+$SafeUser = $SafeUser.Trim('-')
+
+$MaxUserLength = $DnsLabelMax - $Suffix.Length
+if ($SafeUser.Length -gt $MaxUserLength) {
+    $SafeUser = $SafeUser.Substring(0, $MaxUserLength).TrimEnd('-')
+}
+
+if ([string]::IsNullOrEmpty($SafeUser)) {
+    Write-Err "Name must contain at least one letter or digit."
+}
+
+$Hostname = "$SafeUser$Suffix"
+
+if ($SafeUser -ne $User) {
+    Write-Info "Device name normalised to '$SafeUser' (lower case, only letters, digits and dashes, $DnsLabelMax characters max including the '$Suffix' suffix)."
+}
 
 # Check if running as admin
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
