@@ -1,25 +1,27 @@
 # Headscale VPN Setup Script - Windows
-# Usage: .\install.ps1 [[-User] john.d] [-Key AUTH_KEY]
+# Usage: .\install.ps1 -Server https://your-headscale-server [-User john.d] [-Key AUTH_KEY]
 # Run as Administrator for best results
 #
-# Required environment variable:
-#   HEADSCALE_URL  - URL of your Headscale server
-#   Set it with: $env:HEADSCALE_URL = "https://your-headscale-server"
+# Server URL input:
+#   -Server         Preferred
+#   HEADSCALE_URL   Fallback for automation
 
 param(
     [Parameter(Position=0)]
     [string]$User = "",
-    [string]$Key = ""
+    [string]$Key = "",
+    [string]$Server = ""
 )
 
 # Configuration
 $MAX_SERVICE_WAIT_ATTEMPTS = 10
 $ErrorActionPreference = "Stop"
 
-$HeadscaleUrl = $env:HEADSCALE_URL
+$HeadscaleUrl = if (-not [string]::IsNullOrEmpty($Server)) { $Server } else { $env:HEADSCALE_URL }
 if ([string]::IsNullOrEmpty($HeadscaleUrl)) {
-    Write-Host "[ERROR] HEADSCALE_URL environment variable is required." -ForegroundColor Red
-    Write-Host "  Set it with: `$env:HEADSCALE_URL = 'https://your-headscale-server'" -ForegroundColor Red
+    Write-Host "[ERROR] Headscale server URL is required." -ForegroundColor Red
+    Write-Host "  Use: -Server https://your-headscale-server" -ForegroundColor Red
+    Write-Host "  Or set: `$env:HEADSCALE_URL = 'https://your-headscale-server'" -ForegroundColor Red
     exit 1
 }
 
