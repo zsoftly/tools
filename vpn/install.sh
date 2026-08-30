@@ -1,6 +1,6 @@
 #!/bin/bash
 # Headscale VPN Setup Script - macOS/Linux
-# Usage: HEADSCALE_URL=https://your-headscale-server ./install.sh [john.d] [--key AUTH_KEY]
+# Usage: HEADSCALE_URL=https://your-headscale-server ./install.sh [john-d] [--key AUTH_KEY]
 #
 # Server URL input:
 #   HEADSCALE_URL   Preferred
@@ -33,14 +33,14 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --server|-s)
             if [[ -z "${2:-}" || "$2" == -* ]]; then
-                error "--server requires a URL value. Usage: HEADSCALE_URL=https://your-headscale-server ./install.sh [john.d] [--key AUTH_KEY]"
+                error "--server requires a URL value. Usage: HEADSCALE_URL=https://your-headscale-server ./install.sh [john-d] [--key AUTH_KEY]"
             fi
             SERVER_URL="$2"
             shift 2
             ;;
         --user|-u)
             if [[ -z "${2:-}" || "$2" == -* ]]; then
-                error "--user requires a name value. Usage: HEADSCALE_URL=https://your-headscale-server ./install.sh [john.d] [--key AUTH_KEY]"
+                error "--user requires a name value. Usage: HEADSCALE_URL=https://your-headscale-server ./install.sh [john-d] [--key AUTH_KEY]"
             fi
             FULL_NAME="$2"
             shift 2
@@ -53,7 +53,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         *)
-            # Accept positional name argument (e.g. john.d)
+            # Accept positional name argument (e.g. john-d)
             if [[ -z "$FULL_NAME" && "$1" != -* ]]; then
                 FULL_NAME="$1"
             fi

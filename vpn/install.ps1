@@ -1,5 +1,5 @@
 # Headscale VPN Setup Script - Windows
-# Usage: .\install.ps1 -Server https://your-headscale-server [-User john.d] [-Key AUTH_KEY]
+# Usage: .\install.ps1 -Server https://your-headscale-server [-User john-d] [-Key AUTH_KEY]
 # Run as Administrator for best results
 #
 # Server URL input:
@@ -33,7 +33,7 @@ function Write-Err { param($msg) Write-Host "[ERROR] $msg" -ForegroundColor Red;
 # Prompt for name if not provided
 if ([string]::IsNullOrEmpty($User)) {
     Write-Host ""
-    $User = Read-Host "Enter your name (e.g. john.d)"
+    $User = Read-Host "Enter your name (e.g. john-d)"
     Write-Host ""
 }
 
