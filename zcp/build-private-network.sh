@@ -338,9 +338,13 @@ until remote "$HEADSCALE_IP" "test -f /etc/headplane/credentials.txt" "$HEADSCAL
 done
 success "First boot complete"
 
-info "Repointing server_url/base_url at the public IP and restarting the stack..."
+info "Repointing server_url at the public IP and restarting the stack..."
+# server_url (Headscale's mesh control endpoint, port 8080) needs the public IP -
+# real remote devices connect to it directly. base_url (the admin UI, port 3000)
+# stays on localhost: the admin UI is never opened to the internet, only reached
+# through an SSH tunnel, so it must match how the browser actually sees it.
 remote "$HEADSCALE_IP" "sudo sed -i 's|^server_url:.*|server_url: http://${HEADSCALE_IP}:8080|' /opt/headplane/headscale/config/config.yaml" "$HEADSCALE_USER"
-remote "$HEADSCALE_IP" "sudo sed -i 's|^  base_url:.*|  base_url: \"http://${HEADSCALE_IP}:3000\"|' /opt/headplane/headplane/config.yaml" "$HEADSCALE_USER"
+remote "$HEADSCALE_IP" "sudo sed -i 's|^  base_url:.*|  base_url: \"http://localhost:3000\"|' /opt/headplane/headplane/config.yaml" "$HEADSCALE_USER"
 remote "$HEADSCALE_IP" "cd /opt/headplane && sudo docker compose restart" "$HEADSCALE_USER"
 success "Headplane repointed at $HEADSCALE_IP and restarted"
 
@@ -372,19 +376,20 @@ else
   STILL_OPEN="$(zcp firewall list --ip "$IP_SLUG" -o json | jq '[.[] | select((.protocol=="tcp" or .protocol=="udp") and .ports=="22" and .cidr=="0.0.0.0/0")] | length')"
   [ "$STILL_OPEN" = "0" ] || error "SSH lockdown failed: $STILL_OPEN rule(s) still allow 0.0.0.0/0 on port 22 for '$HEADSCALE_NAME'. Check manually: zcp firewall list --ip $IP_SLUG"
 
-  info "Opening ports 3000 (admin, scoped to you) and 8080 (mesh control, open)..."
-  zcp firewall create --ip "$IP_SLUG" --protocol tcp --start-port 3000 --end-port 3000 --cidr "$MY_IP"
+  info "Opening port 8080 (mesh control, open to every device that will ever connect)..."
+  # Port 3000 (the admin UI) is deliberately never opened on the firewall. The
+  # API key it protects controls the entire mesh - reachable only through an
+  # SSH tunnel over the port 22 rule above, never over plain HTTP on the
+  # internet.
   zcp firewall create --ip "$IP_SLUG" --protocol tcp --start-port 8080 --end-port 8080 --cidr 0.0.0.0/0
-  zcp portforward create --ip "$IP_SLUG" --protocol tcp --public-port 3000 --public-end-port 3000 \
-    --private-port 3000 --private-end-port 3000 --instance "$HEADSCALE_SLUG"
   zcp portforward create --ip "$IP_SLUG" --protocol tcp --public-port 8080 --public-end-port 8080 \
     --private-port 8080 --private-end-port 8080 --instance "$HEADSCALE_SLUG"
-  success "Firewall + port-forward rules in place"
+  success "Firewall + port-forward rule in place"
 fi
 
 HEADPLANE_API_KEY="$(remote "$HEADSCALE_IP" "sudo cat /etc/headplane/credentials.txt" "$HEADSCALE_USER" | grep -oE 'hskey-[A-Za-z0-9_-]+' | head -1)"
 [ -n "$HEADPLANE_API_KEY" ] || warn "Could not parse the Headplane API key automatically. Read it manually: ssh ${HEADSCALE_USER}@$HEADSCALE_IP sudo cat /etc/headplane/credentials.txt"
-success "Headplane ready: http://${HEADSCALE_IP}:3000/admin/login"
+success "Headplane ready (admin UI reachable only via SSH tunnel, see the summary at the end)"
 info "API key (also saved on the VM at /etc/headplane/credentials.txt): $HEADPLANE_API_KEY"
 
 # ---------------------------------------------------------------------------
@@ -476,7 +481,9 @@ Private network built:
   VPC                 : $VPC_NAME
   Private tier         : $TIER_NAME ($TIER_CIDR, no public IP)
   ACL                    : $ACL_NAME (tier CIDR + mesh CIDR only)
-  Headplane / Headscale   : $HEADSCALE_NAME -> http://${HEADSCALE_IP}:3000/admin/login
+  Headplane / Headscale   : $HEADSCALE_NAME (admin UI on port 3000, SSH tunnel only, not public)
+                              Tunnel: ssh -L 3000:localhost:3000 ${HEADSCALE_USER}@${HEADSCALE_IP}
+                              Then open: http://localhost:3000/admin/login
                               API key: ${HEADPLANE_API_KEY:-<see /etc/headplane/credentials.txt>}
   Subnet router             : $ROUTER_NAME -> tier IP ${ROUTER_TIER_IP}
                               SSH: ssh ${ROUTER_USER}@${ROUTER_IP} (for troubleshooting)
