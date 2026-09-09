@@ -351,41 +351,58 @@ success "Headplane repointed at $HEADSCALE_IP and restarted"
 IP_SLUG="$(zcp ip list -o json | jq -r --arg vm "$HEADSCALE_NAME" '.[] | select(.vm==$vm) | .slug' | head -1)"
 [ -n "$IP_SLUG" ] || error "Could not find the public IP slug for '$HEADSCALE_NAME'."
 
-ALREADY_LOCKED_DOWN="false"
-if zcp firewall list --ip "$IP_SLUG" -o json | jq -e --arg c "$MY_IP" \
+# Every rule below is reconciled independently: checked, then created only if
+# missing. That's instead of gating the whole block on one proxy marker. A single
+# marker (e.g. "does the scoped SSH rule exist") can be true even when a prior
+# run failed partway through, leaving port 8080 never opened while the script
+# still reports success on a rerun.
+
+info "Locking down the template's default open SSH rule..."
+OPEN_SSH_RULES_JSON="$(zcp firewall list --ip "$IP_SLUG" -o json)" || error "Could not list firewall rules for '$HEADSCALE_NAME' (IP slug $IP_SLUG)."
+OPEN_SSH_RULE_IDS="$(echo "$OPEN_SSH_RULES_JSON" | jq -r '.[] | select((.protocol=="tcp" or .protocol=="udp") and .ports=="22" and .cidr=="0.0.0.0/0") | .id')"
+if [ -n "$OPEN_SSH_RULE_IDS" ]; then
+  while read -r rule_id; do
+    [ -n "$rule_id" ] && zcp firewall delete "$rule_id" --ip "$IP_SLUG" --yes
+  done <<< "$OPEN_SSH_RULE_IDS"
+fi
+
+# Defense in depth: a VM built with an older version of this script may still
+# have port 3000 open from before the admin UI moved to SSH-tunnel-only. Close
+# it if found, regardless of how this VM was originally built.
+OPEN_3000_RULE_IDS="$(zcp firewall list --ip "$IP_SLUG" -o json | jq -r '.[] | select(.protocol=="tcp" and .ports=="3000") | .id')"
+if [ -n "$OPEN_3000_RULE_IDS" ]; then
+  warn "Found an existing port 3000 rule (from an older run or manual change). Removing it. The admin UI is SSH-tunnel-only."
+  while read -r rule_id; do
+    [ -n "$rule_id" ] && zcp firewall delete "$rule_id" --ip "$IP_SLUG" --yes
+  done <<< "$OPEN_3000_RULE_IDS"
+fi
+
+if ! zcp firewall list --ip "$IP_SLUG" -o json | jq -e --arg c "$MY_IP" \
     '.[] | select(.protocol=="tcp" and .ports=="22" and .cidr==$c)' >/dev/null 2>&1; then
-  ALREADY_LOCKED_DOWN="true"
-fi
-
-if [ "$ALREADY_LOCKED_DOWN" = "true" ]; then
-  warn "Firewall/port-forward rules for '$HEADSCALE_NAME' already look configured (found your scoped SSH rule), skipping."
-else
-  info "Locking down the template's default open SSH rule..."
-  OPEN_SSH_RULES_JSON="$(zcp firewall list --ip "$IP_SLUG" -o json)" || error "Could not list firewall rules for '$HEADSCALE_NAME' (IP slug $IP_SLUG)."
-  OPEN_SSH_RULE_IDS="$(echo "$OPEN_SSH_RULES_JSON" | jq -r '.[] | select((.protocol=="tcp" or .protocol=="udp") and .ports=="22" and .cidr=="0.0.0.0/0") | .id')"
-  if [ -n "$OPEN_SSH_RULE_IDS" ]; then
-    while read -r rule_id; do
-      [ -n "$rule_id" ] && zcp firewall delete "$rule_id" --ip "$IP_SLUG" --yes
-    done <<< "$OPEN_SSH_RULE_IDS"
-  fi
   zcp firewall create --ip "$IP_SLUG" --protocol tcp --start-port 22 --end-port 22 --cidr "$MY_IP"
-
-  # Post-condition: confirm the default-open SSH rule is actually gone, rather
-  # than trusting the delete loop ran (a failed 'zcp firewall list' above would
-  # otherwise leave port 22 open to 0.0.0.0/0 while this script reports success).
-  STILL_OPEN="$(zcp firewall list --ip "$IP_SLUG" -o json | jq '[.[] | select((.protocol=="tcp" or .protocol=="udp") and .ports=="22" and .cidr=="0.0.0.0/0")] | length')"
-  [ "$STILL_OPEN" = "0" ] || error "SSH lockdown failed: $STILL_OPEN rule(s) still allow 0.0.0.0/0 on port 22 for '$HEADSCALE_NAME'. Check manually: zcp firewall list --ip $IP_SLUG"
-
-  info "Opening port 8080 (mesh control, open to every device that will ever connect)..."
-  # Port 3000 (the admin UI) is deliberately never opened on the firewall. The
-  # API key it protects controls the entire mesh - reachable only through an
-  # SSH tunnel over the port 22 rule above, never over plain HTTP on the
-  # internet.
-  zcp firewall create --ip "$IP_SLUG" --protocol tcp --start-port 8080 --end-port 8080 --cidr 0.0.0.0/0
-  zcp portforward create --ip "$IP_SLUG" --protocol tcp --public-port 8080 --public-end-port 8080 \
-    --private-port 8080 --private-end-port 8080 --instance "$HEADSCALE_SLUG"
-  success "Firewall + port-forward rule in place"
 fi
+
+# Post-condition: confirm the default-open SSH rule and port 3000 are both
+# actually gone, rather than trusting the delete loops ran (a failed
+# 'zcp firewall list' above would otherwise leave either exposed while this
+# script reports success).
+STILL_OPEN="$(zcp firewall list --ip "$IP_SLUG" -o json | jq '[.[] | select((.protocol=="tcp" or .protocol=="udp") and (.ports=="22" and .cidr=="0.0.0.0/0" or .ports=="3000"))] | length')"
+[ "$STILL_OPEN" = "0" ] || error "Lockdown failed: $STILL_OPEN rule(s) still expose 0.0.0.0/0 on port 22 or any rule on port 3000 for '$HEADSCALE_NAME'. Check manually: zcp firewall list --ip $IP_SLUG"
+
+info "Opening port 8080 (mesh control, open to every device that will ever connect)..."
+if ! zcp firewall list --ip "$IP_SLUG" -o json | jq -e \
+    '.[] | select(.protocol=="tcp" and .ports=="8080" and .cidr=="0.0.0.0/0")' >/dev/null 2>&1; then
+  zcp firewall create --ip "$IP_SLUG" --protocol tcp --start-port 8080 --end-port 8080 --cidr 0.0.0.0/0
+fi
+# Port-forward creation doesn't have a verified JSON shape to check against, so
+# this attempts the create and tolerates an "already exists" style failure,
+# the same pattern used for add-network above, rather than risk a wrong field
+# name silently skipping the check.
+if ! PORTFORWARD_OUTPUT="$(zcp portforward create --ip "$IP_SLUG" --protocol tcp --public-port 8080 --public-end-port 8080 \
+    --private-port 8080 --private-end-port 8080 --instance "$HEADSCALE_SLUG" 2>&1)"; then
+  echo "$PORTFORWARD_OUTPUT" | grep -qi "already" || error "Failed to create the port 8080 port-forward rule: $PORTFORWARD_OUTPUT"
+fi
+success "Firewall + port-forward rule in place"
 
 HEADPLANE_API_KEY="$(remote "$HEADSCALE_IP" "sudo cat /etc/headplane/credentials.txt" "$HEADSCALE_USER" | grep -oE 'hskey-[A-Za-z0-9_-]+' | head -1)"
 [ -n "$HEADPLANE_API_KEY" ] || warn "Could not parse the Headplane API key automatically. Read it manually: ssh ${HEADSCALE_USER}@$HEADSCALE_IP sudo cat /etc/headplane/credentials.txt"
@@ -430,7 +447,12 @@ ROUTER_USER="$(echo "$ROUTER_INSTANCE_JSON" | jq -r '.[] | select(.field=="Usern
 wait_for_ssh "$ROUTER_IP" "$SSH_WAIT_SECONDS" "$ROUTER_USER"
 
 info "Bringing up the tier NIC (hot-added, not auto-configured by the OS)..."
-TIER_NIC="$(remote "$ROUTER_IP" "ip -br link show | awk '{print \$1}' | grep -v '^lo\$' | grep -v '^enp' | tail -1" "$ROUTER_USER")"
+# Excludes lo (loopback), enp* (the router's own public NIC), and tailscale*
+# (Tailscale's own virtual interface, which does not exist on a fresh VM but
+# does on any rerun against an already-configured router. Without this
+# exclusion, 'tail -1' would pick tailscale0 instead of the real tier NIC and
+# overwrite its netplan config).
+TIER_NIC="$(remote "$ROUTER_IP" "ip -br link show | awk '{print \$1}' | grep -v '^lo\$' | grep -v '^enp' | grep -v '^tailscale' | tail -1" "$ROUTER_USER")"
 [ -n "$TIER_NIC" ] || error "Could not identify the tier NIC on '$ROUTER_NAME'. Check manually: ssh ${ROUTER_USER}@$ROUTER_IP 'ip -br link show'"
 remote "$ROUTER_IP" "sudo tee /etc/netplan/60-tier-nic.yaml >/dev/null <<EOF
 network:
@@ -443,6 +465,13 @@ remote "$ROUTER_IP" "sudo netplan apply" "$ROUTER_USER"
 sleep 5
 ROUTER_TIER_IP="$(remote "$ROUTER_IP" "ip -4 -br addr show ${TIER_NIC} | awk '{print \$3}' | cut -d/ -f1" "$ROUTER_USER")"
 [ -n "$ROUTER_TIER_IP" ] || error "Tier NIC did not come up with an address. Check manually: ssh ${ROUTER_USER}@$ROUTER_IP"
+# Belt and suspenders: even with the exclusions above, confirm the address
+# that actually came up is really on the tier, not some other interface that
+# slipped through.
+case "$ROUTER_TIER_IP" in
+  "${NET_OCTET1}.${NET_OCTET2}.1."*) ;;
+  *) error "Interface '$TIER_NIC' came up with $ROUTER_TIER_IP, which is not on the tier ($TIER_CIDR). Wrong interface selected. Check manually: ssh ${ROUTER_USER}@$ROUTER_IP 'ip -br addr show'" ;;
+esac
 success "Tier NIC ($TIER_NIC) up at $ROUTER_TIER_IP"
 
 info "Installing Tailscale and enabling IP forwarding..."

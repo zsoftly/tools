@@ -5,7 +5,10 @@
 # also creates its own standalone network that instance delete never touches.
 # This script detects one left behind but can't safely delete it automatically
 # (the zcp CLI has no way to resolve that network by ID to a deletable slug) -
-# it reports what's left and where to find it instead.
+# it reports what's left and where to find it instead. On a rerun where a VM
+# was already gone before this run started, that detection can't happen at
+# all (the network reference is only capturable while the VM still exists),
+# so those are reported as unverified rather than silently assumed clean.
 #
 # Usage:
 #   ./destroy-private-network.sh --name my-workspace [--region ...] [--project ...]
@@ -102,12 +105,19 @@ capture_vm_network_id() {
 }
 
 step "Capturing per-VM network references before deletion"
+# This only works while the VM still exists. On a rerun after a previous
+# invocation already deleted it, there's no '.vm' association left to find,
+# so these come back empty. ROUTER_PRESENT/HEADSCALE_PRESENT track that
+# distinction below, so a rerun reports "unverified" instead of a false
+# "no leftover" for anything it can no longer check.
 ROUTER_NETWORK_ID="$(capture_vm_network_id "$ROUTER_NAME")"
 HEADSCALE_NETWORK_ID="$(capture_vm_network_id "$HEADSCALE_NAME")"
 
 step "Deleting instances"
 
+ROUTER_PRESENT="false"
 if zcp instance get "$ROUTER_NAME" >/dev/null 2>&1; then
+  ROUTER_PRESENT="true"
   zcp instance delete "$ROUTER_NAME" --yes
   info "Waiting for '$ROUTER_NAME' to finish deleting..."
   if wait_for_gone "$ROUTER_NAME"; then
@@ -118,7 +128,9 @@ else
   warn "'$ROUTER_NAME' not found, skipping."
 fi
 
+HEADSCALE_PRESENT="false"
 if zcp instance get "$HEADSCALE_NAME" >/dev/null 2>&1; then
+  HEADSCALE_PRESENT="true"
   zcp instance delete "$HEADSCALE_NAME" --yes
   info "Waiting for '$HEADSCALE_NAME' to finish deleting..."
   if wait_for_gone "$HEADSCALE_NAME"; then
@@ -157,7 +169,20 @@ step "Checking for a leftover standalone network"
 # the network_id captured before deletion (matching on .vm is unreliable here
 # since that field goes empty once the VM is gone).
 LEFTOVER=""
-for net_id in "$ROUTER_NETWORK_ID" "$HEADSCALE_NETWORK_ID"; do
+UNVERIFIED=""
+for pair in "$ROUTER_NAME:$ROUTER_NETWORK_ID:$ROUTER_PRESENT" "$HEADSCALE_NAME:$HEADSCALE_NETWORK_ID:$HEADSCALE_PRESENT"; do
+  name="${pair%%:*}"
+  rest="${pair#*:}"
+  net_id="${rest%%:*}"
+  present="${rest#*:}"
+  if [ "$present" = "false" ]; then
+    # This VM was already gone before this run started, so its network_id was
+    # never captured. Report this as unverified rather than silently treating
+    # it the same as "checked and clean". A genuine leftover could still be
+    # sitting there from whatever deleted the VM originally.
+    UNVERIFIED="${UNVERIFIED}${name}"$'\n'
+    continue
+  fi
   [ -n "$net_id" ] || continue
   found="$(zcp ip list -o json | jq -r --arg id "$net_id" '.[] | select(.network_id==$id) | .slug' | head -1)"
   [ -n "$found" ] && LEFTOVER="${LEFTOVER}${found} (network id: ${net_id})"$'\n'
@@ -168,6 +193,10 @@ if [ -n "$LEFTOVER" ]; then
   echo "$LEFTOVER" >&2
   warn "Find and remove these from the CMP web portal (search by the network ID above), or ask platform"
   warn "support. The zcp CLI can't resolve or delete a network by ID today."
+elif [ -n "$UNVERIFIED" ]; then
+  warn "Cannot verify network cleanup for: $(echo "$UNVERIFIED" | tr '\n' ' ')(already gone before this"
+  warn "run started, so there was nothing to check a leftover network against). If this is the first"
+  warn "time you're tearing this deployment down, that's unexpected. Check the CMP portal manually."
 else
   success "No leftover network tied to what this run created"
 fi
