@@ -85,16 +85,26 @@ ROUTER_NAME="${NAME_PREFIX}-subnet-router"
 wait_for_gone() {
   # Returns non-zero on timeout instead of hard-exiting, so a single slow or
   # stuck deletion doesn't abort the rest of the teardown.
-  local name="$1" waited=0
-  while zcp instance get "$name" >/dev/null 2>&1; do
+  #
+  # 'instance get' failing does not by itself mean the instance is gone: an API
+  # hiccup, an auth blip, or a transient network error all fail the same way.
+  # Only a "not found" style error means the instance is actually deleted -
+  # every other failure is retried like a still-present instance, so a flaky
+  # API can't make this report a deletion that hasn't happened yet.
+  local name="$1" waited=0 output
+  while true; do
+    if output="$(zcp instance get "$name" 2>&1)"; then
+      : # still present, fall through to the wait/retry below
+    elif echo "$output" | grep -qi "not found"; then
+      return 0
+    fi
     waited=$((waited + 5))
     if [ "$waited" -ge "$DELETE_WAIT_SECONDS" ]; then
-      warn "'$name' did not finish deleting within ${DELETE_WAIT_SECONDS}s. Continuing with the rest of the teardown. Check manually: zcp instance get $name"
+      warn "'$name' did not confirm as deleted within ${DELETE_WAIT_SECONDS}s. Continuing with the rest of the teardown. Check manually: zcp instance get $name"
       return 1
     fi
     sleep 5
   done
-  return 0
 }
 
 # Captures the standalone network each VM's own --network-plan deploy created,
@@ -188,16 +198,22 @@ for pair in "$ROUTER_NAME:$ROUTER_NETWORK_ID:$ROUTER_PRESENT" "$HEADSCALE_NAME:$
   [ -n "$found" ] && LEFTOVER="${LEFTOVER}${found} (network id: ${net_id})"$'\n'
 done
 
+# Reported independently, not if/elif: a rerun can easily have one VM that was
+# already gone (UNVERIFIED) and one that was just deleted with a confirmed
+# leftover (LEFTOVER) in the same pass. Chaining them with elif would let a
+# real LEFTOVER hide an UNVERIFIED, or vice versa.
 if [ -n "$LEFTOVER" ]; then
   warn "Left behind: a standalone network 'instance delete' doesn't clean up, and its pinned IP(s):"
   echo "$LEFTOVER" >&2
   warn "Find and remove these from the CMP web portal (search by the network ID above), or ask platform"
   warn "support. The zcp CLI can't resolve or delete a network by ID today."
-elif [ -n "$UNVERIFIED" ]; then
+fi
+if [ -n "$UNVERIFIED" ]; then
   warn "Cannot verify network cleanup for: $(echo "$UNVERIFIED" | tr '\n' ' ')(already gone before this"
   warn "run started, so there was nothing to check a leftover network against). If this is the first"
   warn "time you're tearing this deployment down, that's unexpected. Check the CMP portal manually."
-else
+fi
+if [ -z "$LEFTOVER" ] && [ -z "$UNVERIFIED" ]; then
   success "No leftover network tied to what this run created"
 fi
 
@@ -206,4 +222,10 @@ if [ "$DELETED_COUNT" -eq 0 ]; then
   warn "Nothing matched --name '$NAME_PREFIX'. No resources were found or deleted. If you expected something here, check the actual prefix with: zcp vpc list"
 else
   echo "$DELETED_COUNT resource(s) removed for --name '$NAME_PREFIX'." >&2
+fi
+
+# Non-zero exit whenever cleanup is provably incomplete, so CI/automation
+# driving this script can detect it instead of seeing exit 0 and moving on.
+if [ -n "$LEFTOVER" ] || [ -n "$UNVERIFIED" ]; then
+  exit 2
 fi

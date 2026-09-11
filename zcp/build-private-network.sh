@@ -218,17 +218,50 @@ if [ "$AUTO_YES" != "true" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Slug lookup helpers
+# Existence + slug lookup helpers
+#
+# Every check below captures the list output FIRST and fails loudly if that
+# call itself failed (transient API error), rather than letting a failed
+# lookup fall through to "not found" and risk creating a duplicate resource.
 #
 # The human-readable --name you pass is not always the slug the API expects:
 # slugs auto-suffix on collision (an existing resource named "test-vpc" can
-# have slug "test-vpc-1"). Always resolve the real slug right after a create
-# (or right after finding an existing resource) and use that slug for every
-# later reference, never the name string itself.
+# have slug "test-vpc-1"). The *_slug_for_name helpers resolve the real slug
+# and require exactly one match, aborting on ambiguity rather than silently
+# picking the first of several same-named resources.
 # ---------------------------------------------------------------------------
-vpc_slug_for_name() { zcp vpc list -o json | jq -r --arg n "$1" '.[] | select(.name==$n) | .slug' | head -1; }
-network_slug_for_name() { zcp network list -o json | jq -r --arg n "$1" '.[] | select(.name==$n) | .slug' | head -1; }
-instance_slug_for_name() { zcp instance list -o json | jq -r --arg n "$1" '.[] | select(.name==$n) | .slug' | head -1; }
+vpc_exists() {
+  local list_json
+  list_json="$(zcp vpc list -o json)" || error "Could not list VPCs to check whether '$1' already exists."
+  echo "$list_json" | jq -e --arg n "$1" '.[] | select(.name==$n)' >/dev/null 2>&1
+}
+network_exists() {
+  local list_json
+  list_json="$(zcp network list -o json)" || error "Could not list networks to check whether '$1' already exists."
+  echo "$list_json" | jq -e --arg n "$1" '.[] | select(.name==$n)' >/dev/null 2>&1
+}
+instance_exists() {
+  local list_json
+  list_json="$(zcp instance list -o json)" || error "Could not list instances to check whether '$1' already exists."
+  echo "$list_json" | jq -e --arg n "$1" '.[] | select(.name==$n)' >/dev/null 2>&1
+}
+
+slug_for_name() {
+  # $1 = resource label (for error messages), $2 = zcp list command, $3 = name to resolve
+  local label="$1" list_cmd="$2" name="$3" list_json matches count
+  list_json="$(eval "$list_cmd")" || error "Could not list ${label}s to resolve the slug for '$name'."
+  matches="$(echo "$list_json" | jq --arg n "$name" '[.[] | select(.name==$n)]')"
+  count="$(echo "$matches" | jq 'length')"
+  case "$count" in
+    0) error "No $label named '$name' found after creation. This shouldn't happen, check manually: $list_cmd" ;;
+    1) echo "$matches" | jq -r '.[0].slug' ;;
+    *) error "Ambiguous: $count ${label}s are named '$name'. This script can't safely tell them apart, rename or remove the duplicate, then re-run. ($list_cmd)" ;;
+  esac
+}
+
+vpc_slug_for_name() { slug_for_name "VPC" "zcp vpc list -o json" "$1"; }
+network_slug_for_name() { slug_for_name "network" "zcp network list -o json" "$1"; }
+instance_slug_for_name() { slug_for_name "instance" "zcp instance list -o json" "$1"; }
 
 wait_for_ssh() {
   local ip="$1" timeout="$2" user="${3:-ubuntu}" waited=0
@@ -255,7 +288,7 @@ remote() {
 # ---------------------------------------------------------------------------
 step "Step 5/8: VPC and private tier"
 
-if zcp vpc list -o json | jq -e --arg n "$VPC_NAME" '.[] | select(.name==$n)' >/dev/null 2>&1; then
+if vpc_exists "$VPC_NAME"; then
   warn "VPC '$VPC_NAME' already exists, skipping creation."
 else
   zcp vpc create --name "$VPC_NAME" --plan "$ROUTER_VPC_PLAN" \
@@ -264,9 +297,8 @@ else
   success "VPC '$VPC_NAME' created"
 fi
 VPC_SLUG="$(vpc_slug_for_name "$VPC_NAME")"
-[ -n "$VPC_SLUG" ] || error "Could not resolve the real slug for VPC '$VPC_NAME' after creation."
 
-if zcp network list -o json | jq -e --arg n "$TIER_NAME" '.[] | select(.name==$n)' >/dev/null 2>&1; then
+if network_exists "$TIER_NAME"; then
   warn "Tier '$TIER_NAME' already exists, skipping creation."
 else
   zcp network create --name "$TIER_NAME" --vpc "$VPC_SLUG" \
@@ -274,30 +306,50 @@ else
   success "Private tier '$TIER_NAME' created (no public IP by default)"
 fi
 TIER_SLUG="$(network_slug_for_name "$TIER_NAME")"
-[ -n "$TIER_SLUG" ] || error "Could not resolve the real slug for tier '$TIER_NAME' after creation."
 
 # ---------------------------------------------------------------------------
 # Step 6: Lock the tier down with a custom ACL
 # ---------------------------------------------------------------------------
 step "Step 6/8: Custom network ACL"
 
+# Checks the actual rule content (protocol/action/traffic-direction/CIDR), not
+# just that 4 rules happen to exist, an unrelated ACL that coincidentally has
+# 4 rules must not be accepted as "already correctly configured".
+acl_content_ok() {
+  local rules_json
+  rules_json="$(zcp acl rules "$VPC_SLUG" "$ACL_NAME" -o json)" 2>/dev/null || return 1
+  echo "$rules_json" | jq -e --arg tier "$TIER_CIDR" --arg mesh "$MESH_CIDR" '
+    def has_rule(dir; cidr):
+      [.[] | select(
+        ((.protocol // "") | ascii_downcase) == "all" and
+        ((.action // "") | ascii_downcase) == "allow" and
+        ((.traffic // "") | ascii_downcase) == dir and
+        .cidr == cidr
+      )] | length >= 1;
+    has_rule("ingress"; $tier) and has_rule("ingress"; $mesh) and
+    has_rule("egress"; $tier) and has_rule("egress"; $mesh)
+  ' >/dev/null 2>&1
+}
+
 if zcp acl rules "$VPC_SLUG" "$ACL_NAME" >/dev/null 2>&1; then
-  ACL_RULE_COUNT="$(zcp acl rules "$VPC_SLUG" "$ACL_NAME" -o json | jq 'length')"
+  if acl_content_ok; then
+    warn "ACL '$ACL_NAME' already has the expected tier + mesh CIDR rules, skipping rule creation."
+    ACL_NEEDS_RULES="false"
+  else
+    error "ACL '$ACL_NAME' exists but its rules don't match what this script expects (tier CIDR + mesh CIDR, ingress and egress). Inspect it with 'zcp acl rules $VPC_SLUG $ACL_NAME', fix or delete it, then re-run."
+  fi
 else
   zcp vpc acl-create "$VPC_SLUG" --name "$ACL_NAME" --description "Workspace tier lockdown"
-  ACL_RULE_COUNT=0
+  ACL_NEEDS_RULES="true"
 fi
 
-if [ "$ACL_RULE_COUNT" -eq 0 ]; then
+if [ "$ACL_NEEDS_RULES" = "true" ]; then
   zcp acl create-rule "$VPC_SLUG" "$ACL_NAME" --number 1 --protocol all --cidr "$TIER_CIDR" --action allow --traffic-type ingress
   zcp acl create-rule "$VPC_SLUG" "$ACL_NAME" --number 2 --protocol all --cidr "$MESH_CIDR" --action allow --traffic-type ingress
   zcp acl create-rule "$VPC_SLUG" "$ACL_NAME" --number 3 --protocol all --cidr "$TIER_CIDR" --action allow --traffic-type egress
   zcp acl create-rule "$VPC_SLUG" "$ACL_NAME" --number 4 --protocol all --cidr "$MESH_CIDR" --action allow --traffic-type egress
+  acl_content_ok || error "Created ACL rules for '$ACL_NAME' but they don't verify as expected afterward. Check manually: zcp acl rules $VPC_SLUG $ACL_NAME"
   success "ACL '$ACL_NAME' created: tier CIDR + mesh CIDR, ingress and egress"
-elif [ "$ACL_RULE_COUNT" -lt 4 ]; then
-  error "ACL '$ACL_NAME' exists but only has $ACL_RULE_COUNT of the expected 4 rules (a prior run may have failed partway through). Inspect it with 'zcp acl rules $VPC_SLUG $ACL_NAME', fix or delete it, then re-run."
-else
-  warn "ACL '$ACL_NAME' already has $ACL_RULE_COUNT rule(s), skipping rule creation."
 fi
 
 zcp vpc acl-replace --network "$TIER_SLUG" --acl "$ACL_NAME" --vpc "$VPC_SLUG"
@@ -308,7 +360,7 @@ success "ACL applied to '$TIER_NAME'. This is what makes the tier private, not t
 # ---------------------------------------------------------------------------
 step "Step 7/8: Deploy Headplane"
 
-if ! zcp instance list -o json | jq -e --arg n "$HEADSCALE_NAME" '.[] | select(.name==$n)' >/dev/null 2>&1; then
+if ! instance_exists "$HEADSCALE_NAME"; then
   zcp instance create --name "$HEADSCALE_NAME" \
     --template "$HEADPLANE_TEMPLATE" --plan "$HEADPLANE_PLAN" \
     --billing-cycle "$BILLING_CYCLE" --network-plan "$NETWORK_PLAN" \
@@ -318,7 +370,6 @@ else
   warn "'$HEADSCALE_NAME' already exists, skipping creation."
 fi
 HEADSCALE_SLUG="$(instance_slug_for_name "$HEADSCALE_NAME")"
-[ -n "$HEADSCALE_SLUG" ] || error "Could not resolve the real slug for '$HEADSCALE_NAME' after creation."
 
 HEADSCALE_INSTANCE_JSON="$(zcp instance get "$HEADSCALE_SLUG" -o json)"
 HEADSCALE_IP="$(echo "$HEADSCALE_INSTANCE_JSON" | jq -r '.[] | select(.field=="Public IP") | .value' | head -1)"
@@ -356,8 +407,34 @@ IP_SLUG="$(zcp ip list -o json | jq -r --arg vm "$HEADSCALE_NAME" '.[] | select(
 # marker (e.g. "does the scoped SSH rule exist") can be true even when a prior
 # run failed partway through, leaving port 8080 never opened while the script
 # still reports success on a rerun.
+#
+# Order matters here: the scoped SSH rule is created and verified BEFORE the
+# template's default open-to-everyone rule is removed, so a failure mid-lockdown
+# never leaves the VM with zero SSH access at all.
 
 info "Locking down the template's default open SSH rule..."
+
+# Clean up any scoped rule left over from a previous run with a different
+# MY_IP (your IP can change between runs) before adding today's.
+STALE_SCOPED_RULE_IDS="$(zcp firewall list --ip "$IP_SLUG" -o json | jq -r --arg c "$MY_IP" \
+  '.[] | select(.protocol=="tcp" and .ports=="22" and .cidr!="0.0.0.0/0" and .cidr!=$c) | .id')"
+if [ -n "$STALE_SCOPED_RULE_IDS" ]; then
+  warn "Found SSH rule(s) scoped to a different IP than today's ($MY_IP), removing it. Your IP may have changed since the last run."
+  while read -r rule_id; do
+    [ -n "$rule_id" ] && zcp firewall delete "$rule_id" --ip "$IP_SLUG" --yes
+  done <<< "$STALE_SCOPED_RULE_IDS"
+fi
+
+if ! zcp firewall list --ip "$IP_SLUG" -o json | jq -e --arg c "$MY_IP" \
+    '.[] | select(.protocol=="tcp" and .ports=="22" and .cidr==$c)' >/dev/null 2>&1; then
+  zcp firewall create --ip "$IP_SLUG" --protocol tcp --start-port 22 --end-port 22 --cidr "$MY_IP"
+fi
+zcp firewall list --ip "$IP_SLUG" -o json | jq -e --arg c "$MY_IP" \
+    '.[] | select(.protocol=="tcp" and .ports=="22" and .cidr==$c)' >/dev/null 2>&1 \
+  || error "Could not confirm the scoped SSH rule for $MY_IP exists on '$HEADSCALE_NAME'. Not removing the open rule until this is fixed. Check manually: zcp firewall list --ip $IP_SLUG"
+
+# Only now, with a scoped rule confirmed in place, remove the template's
+# default open-to-everyone rule.
 OPEN_SSH_RULES_JSON="$(zcp firewall list --ip "$IP_SLUG" -o json)" || error "Could not list firewall rules for '$HEADSCALE_NAME' (IP slug $IP_SLUG)."
 OPEN_SSH_RULE_IDS="$(echo "$OPEN_SSH_RULES_JSON" | jq -r '.[] | select((.protocol=="tcp" or .protocol=="udp") and .ports=="22" and .cidr=="0.0.0.0/0") | .id')"
 if [ -n "$OPEN_SSH_RULE_IDS" ]; then
@@ -377,11 +454,6 @@ if [ -n "$OPEN_3000_RULE_IDS" ]; then
   done <<< "$OPEN_3000_RULE_IDS"
 fi
 
-if ! zcp firewall list --ip "$IP_SLUG" -o json | jq -e --arg c "$MY_IP" \
-    '.[] | select(.protocol=="tcp" and .ports=="22" and .cidr==$c)' >/dev/null 2>&1; then
-  zcp firewall create --ip "$IP_SLUG" --protocol tcp --start-port 22 --end-port 22 --cidr "$MY_IP"
-fi
-
 # Post-condition: confirm the default-open SSH rule and port 3000 are both
 # actually gone, rather than trusting the delete loops ran (a failed
 # 'zcp firewall list' above would otherwise leave either exposed while this
@@ -394,17 +466,25 @@ if ! zcp firewall list --ip "$IP_SLUG" -o json | jq -e \
     '.[] | select(.protocol=="tcp" and .ports=="8080" and .cidr=="0.0.0.0/0")' >/dev/null 2>&1; then
   zcp firewall create --ip "$IP_SLUG" --protocol tcp --start-port 8080 --end-port 8080 --cidr 0.0.0.0/0
 fi
-# Port-forward creation doesn't have a verified JSON shape to check against, so
-# this attempts the create and tolerates an "already exists" style failure,
-# the same pattern used for add-network above, rather than risk a wrong field
-# name silently skipping the check.
-if ! PORTFORWARD_OUTPUT="$(zcp portforward create --ip "$IP_SLUG" --protocol tcp --public-port 8080 --public-end-port 8080 \
-    --private-port 8080 --private-end-port 8080 --instance "$HEADSCALE_SLUG" 2>&1)"; then
-  echo "$PORTFORWARD_OUTPUT" | grep -qi "already" || error "Failed to create the port 8080 port-forward rule: $PORTFORWARD_OUTPUT"
+# Prefer checking the real portforward list first (protocol/public_port/vm
+# fields, matching this CLI's usual table->JSON naming) over trusting a
+# generic "already exists" style error, which could also match an unrelated
+# failure or a rule pointed at the wrong VM.
+PORTFORWARD_EXISTS="false"
+if zcp portforward list --ip "$IP_SLUG" -o json 2>/dev/null | jq -e --arg vm "$HEADSCALE_SLUG" \
+    '.[] | select(.protocol=="tcp" and (.public_port=="8080" or .public_port==8080) and .vm==$vm)' >/dev/null 2>&1; then
+  PORTFORWARD_EXISTS="true"
+fi
+if [ "$PORTFORWARD_EXISTS" = "false" ]; then
+  if ! PORTFORWARD_OUTPUT="$(zcp portforward create --ip "$IP_SLUG" --protocol tcp --public-port 8080 --public-end-port 8080 \
+      --private-port 8080 --private-end-port 8080 --instance "$HEADSCALE_SLUG" 2>&1)"; then
+    echo "$PORTFORWARD_OUTPUT" | grep -qi "already" || error "Failed to create the port 8080 port-forward rule: $PORTFORWARD_OUTPUT"
+    warn "Port-forward create reported an 'already exists' style error. Could not independently confirm it points at '$HEADSCALE_NAME'. Check manually: zcp portforward list --ip $IP_SLUG"
+  fi
 fi
 success "Firewall + port-forward rule in place"
 
-HEADPLANE_API_KEY="$(remote "$HEADSCALE_IP" "sudo cat /etc/headplane/credentials.txt" "$HEADSCALE_USER" | grep -oE 'hskey-[A-Za-z0-9_-]+' | head -1)"
+HEADPLANE_API_KEY="$(remote "$HEADSCALE_IP" "sudo cat /etc/headplane/credentials.txt" "$HEADSCALE_USER" | grep -oE 'hskey-[A-Za-z0-9_-]+' | head -1 || true)"
 [ -n "$HEADPLANE_API_KEY" ] || warn "Could not parse the Headplane API key automatically. Read it manually: ssh ${HEADSCALE_USER}@$HEADSCALE_IP sudo cat /etc/headplane/credentials.txt"
 success "Headplane ready (admin UI reachable only via SSH tunnel, see the summary at the end)"
 info "API key (also saved on the VM at /etc/headplane/credentials.txt): $HEADPLANE_API_KEY"
@@ -414,7 +494,7 @@ info "API key (also saved on the VM at /etc/headplane/credentials.txt): $HEADPLA
 # ---------------------------------------------------------------------------
 step "Step 8/8: Deploy the subnet router and enroll it in the mesh"
 
-if ! zcp instance list -o json | jq -e --arg n "$ROUTER_NAME" '.[] | select(.name==$n)' >/dev/null 2>&1; then
+if ! instance_exists "$ROUTER_NAME"; then
   zcp instance create --name "$ROUTER_NAME" \
     --template "$ROUTER_TEMPLATE" --plan "$ROUTER_PLAN" --billing-cycle "$BILLING_CYCLE" \
     --network-plan "$NETWORK_PLAN" --storage-category "$STORAGE_CATEGORY_VM" \
@@ -424,7 +504,6 @@ else
   warn "'$ROUTER_NAME' already exists, skipping creation."
 fi
 ROUTER_SLUG="$(instance_slug_for_name "$ROUTER_NAME")"
-[ -n "$ROUTER_SLUG" ] || error "Could not resolve the real slug for '$ROUTER_NAME' after creation."
 
 # Always attempted, not just on fresh create. A prior run could have created
 # the instance and then failed before attaching the tier, and re-running must
@@ -483,7 +562,7 @@ remote "$ROUTER_IP" "grep -qxF 'net.ipv4.ip_forward = 1' /etc/sysctl.d/99-tailsc
 info "Minting a preauth key on Headscale..."
 HEADSCALE_USER_ID="$(remote "$HEADSCALE_IP" "sudo docker exec headscale headscale users list -o json" "$HEADSCALE_USER" | jq -r '.[0].id')"
 [ -n "$HEADSCALE_USER_ID" ] && [ "$HEADSCALE_USER_ID" != "null" ] || error "Could not find a Headscale user. Check manually on $HEADSCALE_IP."
-PREAUTH_KEY="$(remote "$HEADSCALE_IP" "sudo docker exec headscale headscale preauthkeys create --user ${HEADSCALE_USER_ID} --expiration 1h" "$HEADSCALE_USER")"
+PREAUTH_KEY="$(remote "$HEADSCALE_IP" "sudo docker exec headscale headscale preauthkeys create --user ${HEADSCALE_USER_ID} --expiration 1h" "$HEADSCALE_USER" || true)"
 [ -n "$PREAUTH_KEY" ] || error "Could not mint a preauth key for '$ROUTER_NAME' on Headscale."
 
 info "Registering the subnet router and advertising ${TIER_CIDR}..."
@@ -496,7 +575,7 @@ remote "$HEADSCALE_IP" "sudo docker exec headscale headscale nodes approve-route
 success "Route approved. '$ROUTER_NAME' is now the door into '$TIER_NAME'."
 
 info "Minting a preauth key for your own device..."
-OWN_DEVICE_KEY="$(remote "$HEADSCALE_IP" "sudo docker exec headscale headscale preauthkeys create --user ${HEADSCALE_USER_ID} --expiration 24h" "$HEADSCALE_USER")"
+OWN_DEVICE_KEY="$(remote "$HEADSCALE_IP" "sudo docker exec headscale headscale preauthkeys create --user ${HEADSCALE_USER_ID} --expiration 24h" "$HEADSCALE_USER" || true)"
 [ -n "$OWN_DEVICE_KEY" ] || warn "Could not mint a preauth key for your own device. Mint one from the Headplane UI instead."
 
 # ---------------------------------------------------------------------------
