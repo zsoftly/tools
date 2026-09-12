@@ -20,6 +20,7 @@ set -o pipefail
 NAME_PREFIX=""
 DELETE_WAIT_SECONDS=180
 DELETED_COUNT=0
+ISSUED_COUNT=0
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -75,6 +76,14 @@ zcp auth validate >/dev/null 2>&1 || error "zcp CLI is not authenticated."
 [ -n "${ZCP_PROJECT:-}" ] || error "--project (or \$ZCP_PROJECT) is required."
 [ -n "$NAME_PREFIX" ] || error "--name is required (same prefix used with build-private-network.sh)."
 
+# Same validation build-private-network.sh applies to --name: it gets used in
+# a colon-delimited pair below (name:network_id:present), so a name containing
+# ':' would corrupt that parsing.
+NAME_RE='^[a-zA-Z0-9-]+$'
+if ! [[ "$NAME_PREFIX" =~ $NAME_RE ]]; then
+  error "--name '$NAME_PREFIX' must contain only letters, numbers, and hyphens."
+fi
+
 export ZCP_REGION ZCP_PROJECT
 zcp() { command zcp --region "$ZCP_REGION" --project "$ZCP_PROJECT" "$@"; }
 
@@ -111,8 +120,56 @@ wait_for_gone() {
 # before the instance is deleted (the association may not be queryable after).
 capture_vm_network_id() {
   local vm_name="$1"
-  zcp ip list -o json | jq -r --arg vm "$vm_name" '.[] | select(.vm==$vm) | .network_id // empty' | head -1
+  zcp ip list -o json | jq -r --arg vm "$vm_name" '.[] | select(.vm==$vm) | .network_id // empty' | head -1 || true
 }
+
+# Resolves a name to a slug before deleting, same reasoning as the VPC check
+# above: build-private-network.sh's slug_for_name comment documents that
+# slugs auto-suffix on collision, so a bare name can be ambiguous. Sets
+# INSTANCE_PRESENT and, when present, INSTANCE_SLUG_RESOLVED.
+resolve_instance_for_delete() {
+  local name="$1" list_json matches count
+  INSTANCE_PRESENT="false"
+  INSTANCE_SLUG_RESOLVED=""
+  list_json="$(zcp instance list -o json)" || error "Could not list instances to check whether '$name' exists."
+  matches="$(echo "$list_json" | jq --arg n "$name" '[.[] | select(.name==$n)]')"
+  count="$(echo "$matches" | jq 'length')"
+  case "$count" in
+    0) return 0 ;;
+    1)
+      INSTANCE_PRESENT="true"
+      INSTANCE_SLUG_RESOLVED="$(echo "$matches" | jq -r '.[0].slug')"
+      ;;
+    *)
+      error "Ambiguous: $count instances are named '$name'. This script can't safely tell them apart, and deleting the wrong one is irreversible. Rename or remove the duplicate, then re-run. (zcp instance list)"
+      ;;
+  esac
+}
+
+step "Checking the VPC"
+
+# Resolved and ambiguity-checked FIRST, before anything is deleted, same as
+# build-private-network.sh's slug_for_name helper does before every create.
+# This is the one irreversible, destructive call in either script, and it
+# must never silently pick the first of several same-named VPCs (the old
+# 'head -1' behavior). Doing this before the instances are touched also means
+# an ambiguity abort here leaves the account completely untouched, rather
+# than deleting both VMs and then aborting before the leftover-network report
+# ever runs.
+VPC_LIST_JSON="$(zcp vpc list -o json)" || error "Could not list VPCs to check whether '$VPC_NAME' exists."
+VPC_MATCHES="$(echo "$VPC_LIST_JSON" | jq --arg n "$VPC_NAME" '[.[] | select(.name==$n)]')"
+VPC_MATCH_COUNT="$(echo "$VPC_MATCHES" | jq 'length')"
+VPC_SLUG=""
+case "$VPC_MATCH_COUNT" in
+  0) ;;
+  1)
+    VPC_SLUG="$(echo "$VPC_MATCHES" | jq -r '.[0].slug')"
+    [ -n "$VPC_SLUG" ] && [ "$VPC_SLUG" != "null" ] || error "Found VPC '$VPC_NAME' but it has no slug in the API response. Check manually: zcp vpc list"
+    ;;
+  *)
+    error "Ambiguous: $VPC_MATCH_COUNT VPCs are named '$VPC_NAME'. This script can't safely tell them apart, and deleting the wrong one is irreversible. Rename or remove the duplicate, then re-run. (zcp vpc list)"
+    ;;
+esac
 
 step "Capturing per-VM network references before deletion"
 # This only works while the VM still exists. On a rerun after a previous
@@ -126,11 +183,13 @@ HEADSCALE_NETWORK_ID="$(capture_vm_network_id "$HEADSCALE_NAME")"
 step "Deleting instances"
 
 ROUTER_PRESENT="false"
-if zcp instance get "$ROUTER_NAME" >/dev/null 2>&1; then
+resolve_instance_for_delete "$ROUTER_NAME"
+if [ "$INSTANCE_PRESENT" = "true" ]; then
   ROUTER_PRESENT="true"
-  zcp instance delete "$ROUTER_NAME" --yes
+  ISSUED_COUNT=$((ISSUED_COUNT + 1))
+  zcp instance delete "$INSTANCE_SLUG_RESOLVED" --yes
   info "Waiting for '$ROUTER_NAME' to finish deleting..."
-  if wait_for_gone "$ROUTER_NAME"; then
+  if wait_for_gone "$INSTANCE_SLUG_RESOLVED"; then
     success "'$ROUTER_NAME' deleted"
     DELETED_COUNT=$((DELETED_COUNT + 1))
   fi
@@ -139,11 +198,13 @@ else
 fi
 
 HEADSCALE_PRESENT="false"
-if zcp instance get "$HEADSCALE_NAME" >/dev/null 2>&1; then
+resolve_instance_for_delete "$HEADSCALE_NAME"
+if [ "$INSTANCE_PRESENT" = "true" ]; then
   HEADSCALE_PRESENT="true"
-  zcp instance delete "$HEADSCALE_NAME" --yes
+  ISSUED_COUNT=$((ISSUED_COUNT + 1))
+  zcp instance delete "$INSTANCE_SLUG_RESOLVED" --yes
   info "Waiting for '$HEADSCALE_NAME' to finish deleting..."
-  if wait_for_gone "$HEADSCALE_NAME"; then
+  if wait_for_gone "$INSTANCE_SLUG_RESOLVED"; then
     success "'$HEADSCALE_NAME' deleted"
     DELETED_COUNT=$((DELETED_COUNT + 1))
   fi
@@ -153,9 +214,9 @@ fi
 
 step "Deleting VPC (removes the private tier automatically)"
 
-if zcp vpc list -o json | jq -e --arg n "$VPC_NAME" '.[] | select(.name==$n)' >/dev/null 2>&1; then
-  VPC_SLUG="$(zcp vpc list -o json | jq -r --arg n "$VPC_NAME" '.[] | select(.name==$n) | .slug' | head -1)"
-  zcp vpc delete "${VPC_SLUG:-$VPC_NAME}" --yes
+if [ -n "$VPC_SLUG" ]; then
+  ISSUED_COUNT=$((ISSUED_COUNT + 1))
+  zcp vpc delete "$VPC_SLUG" --yes
   success "'$VPC_NAME' deleted"
   DELETED_COUNT=$((DELETED_COUNT + 1))
 else
@@ -190,10 +251,17 @@ for pair in "$ROUTER_NAME:$ROUTER_NETWORK_ID:$ROUTER_PRESENT" "$HEADSCALE_NAME:$
     # never captured. Report this as unverified rather than silently treating
     # it the same as "checked and clean". A genuine leftover could still be
     # sitting there from whatever deleted the VM originally.
-    UNVERIFIED="${UNVERIFIED}${name}"$'\n'
+    UNVERIFIED="${UNVERIFIED}${name} (already gone before this run)"$'\n'
     continue
   fi
-  [ -n "$net_id" ] || continue
+  if [ -z "$net_id" ]; then
+    # The VM WAS present, but no network_id was captured for it (e.g. the
+    # capture itself failed, or the IP has no network_id in this account).
+    # Can't rule out a leftover without one, so this can't be reported as
+    # clean either. Same "don't claim clean when we couldn't check" rule.
+    UNVERIFIED="${UNVERIFIED}${name} (no network reference captured)"$'\n'
+    continue
+  fi
   found="$(zcp ip list -o json | jq -r --arg id "$net_id" '.[] | select(.network_id==$id) | .slug' | head -1)"
   [ -n "$found" ] && LEFTOVER="${LEFTOVER}${found} (network id: ${net_id})"$'\n'
 done
@@ -209,23 +277,32 @@ if [ -n "$LEFTOVER" ]; then
   warn "support. The zcp CLI can't resolve or delete a network by ID today."
 fi
 if [ -n "$UNVERIFIED" ]; then
-  warn "Cannot verify network cleanup for: $(echo "$UNVERIFIED" | tr '\n' ' ')(already gone before this"
-  warn "run started, so there was nothing to check a leftover network against). If this is the first"
-  warn "time you're tearing this deployment down, that's unexpected. Check the CMP portal manually."
+  warn "Cannot verify network cleanup for:"
+  echo "$UNVERIFIED" >&2
+  warn "If this is the first time you're tearing this deployment down, that's unexpected. Check the CMP"
+  warn "portal manually."
 fi
 if [ -z "$LEFTOVER" ] && [ -z "$UNVERIFIED" ]; then
   success "No leftover network tied to what this run created"
 fi
 
 step "Done"
-if [ "$DELETED_COUNT" -eq 0 ]; then
+if [ "$ISSUED_COUNT" -eq 0 ]; then
   warn "Nothing matched --name '$NAME_PREFIX'. No resources were found or deleted. If you expected something here, check the actual prefix with: zcp vpc list"
-else
+elif [ "$DELETED_COUNT" -eq "$ISSUED_COUNT" ]; then
   echo "$DELETED_COUNT resource(s) removed for --name '$NAME_PREFIX'." >&2
+else
+  warn "$ISSUED_COUNT delete(s) issued, only $DELETED_COUNT confirmed. Check the [WARN] lines above for what didn't confirm in time."
 fi
 
 # Non-zero exit whenever cleanup is provably incomplete, so CI/automation
 # driving this script can detect it instead of seeing exit 0 and moving on.
-if [ -n "$LEFTOVER" ] || [ -n "$UNVERIFIED" ]; then
+# LEFTOVER is unconditional: it's a directly confirmed leftover network, never
+# a false positive, regardless of whether this run deleted anything. UNVERIFIED
+# is gated on ISSUED_COUNT > 0: if this run didn't attempt any delete (everything
+# was already gone before it started), UNVERIFIED just means "nothing here to
+# check", not "we left something behind". A confirmatory rerun on an
+# already-clean account should exit 0, not report a false-dirty result forever.
+if [ -n "$LEFTOVER" ] || { [ -n "$UNVERIFIED" ] && [ "$ISSUED_COUNT" -gt 0 ]; }; then
   exit 2
 fi

@@ -185,7 +185,7 @@ resolve() {
     return
   fi
   local resolved
-  resolved="$(eval "$lookup_cmd" | jq -r "$field" | head -1)"
+  resolved="$(eval "$lookup_cmd" | jq -r "$field" | head -1 || true)"
   [ -n "$resolved" ] && [ "$resolved" != "null" ] || error "Could not auto-discover $label. Pass it explicitly (see --help)."
   echo "$resolved"
 }
@@ -272,7 +272,7 @@ wait_for_ssh() {
   while ! ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
       "${user}@${ip}" true 2>/dev/null; do
     waited=$((waited + 5))
-    [ "$waited" -ge "$timeout" ] && error "SSH on $ip did not become ready within ${timeout}s."
+    [ "$waited" -ge "$timeout" ] && error "SSH on $ip did not become ready within ${timeout}s. If this VM was already locked down to a previous --my-ip, and your real IP is different now, add a rule for it manually (zcp firewall create --ip <ip-slug> --protocol tcp --start-port 22 --end-port 22 --cidr <your-ip>/32) and re-run."
     sleep 5
   done
   success "SSH ready on $ip"
@@ -281,6 +281,77 @@ wait_for_ssh() {
 remote() {
   local ip="$1" cmd="$2" user="${3:-ubuntu}"
   ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "${user}@${ip}" "$cmd"
+}
+
+# jq helper: matches a rule's .ports field against a single target port,
+# whether the API represents it as an exact string ("22") or a range
+# ("20-25"). A pure string-equality check misses any pre-existing rule
+# expressed as a range that happens to contain the target port, which would
+# make a security check like lock_down_ssh's post-condition pass while the
+# port is still actually open.
+JQ_PORT_MATCH='def port_has($target): (. // "" | tostring) as $p | ($p == ($target|tostring)) or (($p | test("^[0-9]+-[0-9]+$")) and (($p / "-") as $r | ($r[0]|tonumber) <= $target and $target <= ($r[1]|tonumber))); def proto_is($target): (. // "" | ascii_downcase) == $target;'
+
+# Locks SSH down to $MY_IP on the given IP slug, and is applied to every VM the
+# script creates, not just Headplane. The subnet router is the actual gateway
+# into the private tier, so leaving its SSH open to 0.0.0.0/0 would undercut the
+# whole point of the ACL lockdown done earlier.
+#
+# Order matters: the scoped rule for $MY_IP is created and verified FIRST, and
+# only then are the stale-IP rule and the open 0.0.0.0/0 rule deleted, so a
+# failure mid-lockdown never leaves the VM with zero SSH access at all.
+#
+# Called BEFORE wait_for_ssh for both VMs (see the call sites), not after: this
+# function only talks to the zcp API, never SSH, so on a rerun from a new
+# $MY_IP it can add the new rule and clean up the stale one before anything
+# tries to actually connect. Calling it after wait_for_ssh would deadlock a
+# rerun from a new IP. The old scoped rule would be the only thing open, so
+# wait_for_ssh would hang against the wrong IP and the reconciliation below
+# would never run.
+lock_down_ssh() {
+  local ip_slug="$1" vm_label="$2"
+
+  if ! zcp firewall list --ip "$ip_slug" -o json | jq -e --arg c "$MY_IP" \
+      "$JQ_PORT_MATCH"' .[] | select((.protocol | proto_is("tcp")) and (.ports | port_has(22)) and .cidr==$c)' >/dev/null 2>&1; then
+    zcp firewall create --ip "$ip_slug" --protocol tcp --start-port 22 --end-port 22 --cidr "$MY_IP"
+  fi
+  zcp firewall list --ip "$ip_slug" -o json | jq -e --arg c "$MY_IP" \
+      "$JQ_PORT_MATCH"' .[] | select((.protocol | proto_is("tcp")) and (.ports | port_has(22)) and .cidr==$c)' >/dev/null 2>&1 \
+    || error "Could not confirm the scoped SSH rule for $MY_IP exists on '$vm_label'. Not removing anything until this is fixed. Check manually: zcp firewall list --ip $ip_slug"
+
+  # Clean up any scoped rule left over from a previous run with a different
+  # MY_IP (your IP can change between runs).
+  local stale_ids
+  stale_ids="$(zcp firewall list --ip "$ip_slug" -o json | jq -r --arg c "$MY_IP" \
+    "$JQ_PORT_MATCH"' .[] | select((.protocol | proto_is("tcp")) and (.ports | port_has(22)) and .cidr!="0.0.0.0/0" and .cidr!=$c) | .id')"
+  if [ -n "$stale_ids" ]; then
+    warn "Found SSH rule(s) on '$vm_label' scoped to a different IP than today's ($MY_IP), removing them. Your IP may have changed since the last run."
+    while read -r rule_id; do
+      [ -n "$rule_id" ] && zcp firewall delete "$rule_id" --ip "$ip_slug" --yes
+    done <<< "$stale_ids"
+  fi
+
+  # Only now, with a working scoped rule confirmed in place, remove the
+  # template's default open-to-everyone rule.
+  local open_json open_ids
+  open_json="$(zcp firewall list --ip "$ip_slug" -o json)" || error "Could not list firewall rules for '$vm_label' (IP slug $ip_slug)."
+  open_ids="$(echo "$open_json" | jq -r "$JQ_PORT_MATCH"' .[] | select(((.protocol | proto_is("tcp")) or (.protocol | proto_is("udp"))) and (.ports | port_has(22)) and .cidr=="0.0.0.0/0") | .id' || true)"
+  if [ -n "$open_ids" ]; then
+    while read -r rule_id; do
+      [ -n "$rule_id" ] && zcp firewall delete "$rule_id" --ip "$ip_slug" --yes
+    done <<< "$open_ids"
+  fi
+
+  # Post-condition: confirm the default-open rule is actually gone, rather
+  # than trusting the delete loop ran (a failed 'zcp firewall list' above
+  # would otherwise leave it exposed while this function reports success).
+  # Also re-confirm the scoped rule for $MY_IP is still there. Non-vacuous
+  # even on a VM that never had an open rule to begin with.
+  local still_open
+  still_open="$(zcp firewall list --ip "$ip_slug" -o json | jq "$JQ_PORT_MATCH"' [.[] | select(((.protocol | proto_is("tcp")) or (.protocol | proto_is("udp"))) and (.ports | port_has(22)) and .cidr=="0.0.0.0/0")] | length' || true)"
+  [ "$still_open" = "0" ] || error "Lockdown failed: $still_open rule(s) still expose 0.0.0.0/0 on port 22 for '$vm_label'. Check manually: zcp firewall list --ip $ip_slug"
+  zcp firewall list --ip "$ip_slug" -o json | jq -e --arg c "$MY_IP" \
+      "$JQ_PORT_MATCH"' .[] | select((.protocol | proto_is("tcp")) and (.ports | port_has(22)) and .cidr==$c)' >/dev/null 2>&1 \
+    || error "Lockdown failed: the scoped rule for $MY_IP on '$vm_label' is gone after cleanup. Check manually: zcp firewall list --ip $ip_slug"
 }
 
 # ---------------------------------------------------------------------------
@@ -331,10 +402,30 @@ acl_content_ok() {
   ' >/dev/null 2>&1
 }
 
-if zcp acl rules "$VPC_SLUG" "$ACL_NAME" >/dev/null 2>&1; then
+# Same capture-first-fail-loudly pattern as vpc_exists/network_exists/instance_exists:
+# a transient 'zcp acl rules' failure must not be read as "ACL doesn't exist", or a
+# rerun would try to create a duplicate ACL on top of a real one. The assignment runs
+# as the condition of this 'if' specifically so a failure doesn't trip set -e before
+# the not-found check below gets a chance to run.
+if ACL_LOOKUP_OUTPUT="$(zcp acl rules "$VPC_SLUG" "$ACL_NAME" -o json 2>&1)"; then
+  ACL_EXISTS="true"
+elif echo "$ACL_LOOKUP_OUTPUT" | grep -qi "not found"; then
+  ACL_EXISTS="false"
+else
+  error "Could not determine whether ACL '$ACL_NAME' already exists: $ACL_LOOKUP_OUTPUT"
+fi
+
+if [ "$ACL_EXISTS" = "true" ]; then
   if acl_content_ok; then
     warn "ACL '$ACL_NAME' already has the expected tier + mesh CIDR rules, skipping rule creation."
     ACL_NEEDS_RULES="false"
+  elif [ "$(echo "$ACL_LOOKUP_OUTPUT" | jq 'length')" = "0" ]; then
+    # A completely empty ACL is what THIS script leaves behind if a prior run
+    # died between acl-create and create-rule. That's its own artifact from an
+    # interrupted run, not a real conflict, so add the rules rather than
+    # forcing the user to manually delete something the script itself made.
+    warn "ACL '$ACL_NAME' exists but has no rules yet (likely an interrupted prior run). Adding the expected rules."
+    ACL_NEEDS_RULES="true"
   else
     error "ACL '$ACL_NAME' exists but its rules don't match what this script expects (tier CIDR + mesh CIDR, ingress and egress). Inspect it with 'zcp acl rules $VPC_SLUG $ACL_NAME', fix or delete it, then re-run."
   fi
@@ -371,12 +462,24 @@ else
 fi
 HEADSCALE_SLUG="$(instance_slug_for_name "$HEADSCALE_NAME")"
 
-HEADSCALE_INSTANCE_JSON="$(zcp instance get "$HEADSCALE_SLUG" -o json)"
-HEADSCALE_IP="$(echo "$HEADSCALE_INSTANCE_JSON" | jq -r '.[] | select(.field=="Public IP") | .value' | head -1)"
+HEADSCALE_INSTANCE_JSON="$(zcp instance get "$HEADSCALE_SLUG" -o json)" || error "Could not look up instance details for '$HEADSCALE_NAME'."
+HEADSCALE_IP="$(echo "$HEADSCALE_INSTANCE_JSON" | jq -r '.[] | select(.field=="Public IP") | .value' | head -1 || true)"
 [ -n "$HEADSCALE_IP" ] && [ "$HEADSCALE_IP" != "null" ] || error "Could not determine '$HEADSCALE_NAME' public IP."
-HEADSCALE_USER="$(echo "$HEADSCALE_INSTANCE_JSON" | jq -r '.[] | select(.field=="Username") | .value' | head -1)"
+HEADSCALE_USER="$(echo "$HEADSCALE_INSTANCE_JSON" | jq -r '.[] | select(.field=="Username") | .value' | head -1 || true)"
 [ -n "$HEADSCALE_USER" ] && [ "$HEADSCALE_USER" != "null" ] || HEADSCALE_USER="ubuntu"
 info "Headplane public IP: $HEADSCALE_IP"
+
+# Runs BEFORE wait_for_ssh, not after: lock_down_ssh only talks to the zcp API,
+# so on a rerun from a new $MY_IP it can add the new scoped rule and clean up
+# the stale one before anything tries to actually connect. Waiting for SSH
+# first would deadlock a rerun from a new IP: the old scoped rule would be the
+# only thing open, wait_for_ssh would hang against an IP nothing permits, and
+# the reconciliation that fixes it would never run.
+IP_SLUG="$(zcp ip list -o json | jq -r --arg vm "$HEADSCALE_NAME" '.[] | select(.vm==$vm) | .slug' | head -1 || true)"
+[ -n "$IP_SLUG" ] || error "Could not find the public IP slug for '$HEADSCALE_NAME'."
+
+info "Locking down the template's default open SSH rule..."
+lock_down_ssh "$IP_SLUG" "$HEADSCALE_NAME"
 
 wait_for_ssh "$HEADSCALE_IP" "$SSH_WAIT_SECONDS" "$HEADSCALE_USER"
 
@@ -399,54 +502,12 @@ remote "$HEADSCALE_IP" "sudo sed -i 's|^  base_url:.*|  base_url: \"http://local
 remote "$HEADSCALE_IP" "cd /opt/headplane && sudo docker compose restart" "$HEADSCALE_USER"
 success "Headplane repointed at $HEADSCALE_IP and restarted"
 
-IP_SLUG="$(zcp ip list -o json | jq -r --arg vm "$HEADSCALE_NAME" '.[] | select(.vm==$vm) | .slug' | head -1)"
-[ -n "$IP_SLUG" ] || error "Could not find the public IP slug for '$HEADSCALE_NAME'."
-
-# Every rule below is reconciled independently: checked, then created only if
-# missing. That's instead of gating the whole block on one proxy marker. A single
-# marker (e.g. "does the scoped SSH rule exist") can be true even when a prior
-# run failed partway through, leaving port 8080 never opened while the script
-# still reports success on a rerun.
-#
-# Order matters here: the scoped SSH rule is created and verified BEFORE the
-# template's default open-to-everyone rule is removed, so a failure mid-lockdown
-# never leaves the VM with zero SSH access at all.
-
-info "Locking down the template's default open SSH rule..."
-
-# Clean up any scoped rule left over from a previous run with a different
-# MY_IP (your IP can change between runs) before adding today's.
-STALE_SCOPED_RULE_IDS="$(zcp firewall list --ip "$IP_SLUG" -o json | jq -r --arg c "$MY_IP" \
-  '.[] | select(.protocol=="tcp" and .ports=="22" and .cidr!="0.0.0.0/0" and .cidr!=$c) | .id')"
-if [ -n "$STALE_SCOPED_RULE_IDS" ]; then
-  warn "Found SSH rule(s) scoped to a different IP than today's ($MY_IP), removing it. Your IP may have changed since the last run."
-  while read -r rule_id; do
-    [ -n "$rule_id" ] && zcp firewall delete "$rule_id" --ip "$IP_SLUG" --yes
-  done <<< "$STALE_SCOPED_RULE_IDS"
-fi
-
-if ! zcp firewall list --ip "$IP_SLUG" -o json | jq -e --arg c "$MY_IP" \
-    '.[] | select(.protocol=="tcp" and .ports=="22" and .cidr==$c)' >/dev/null 2>&1; then
-  zcp firewall create --ip "$IP_SLUG" --protocol tcp --start-port 22 --end-port 22 --cidr "$MY_IP"
-fi
-zcp firewall list --ip "$IP_SLUG" -o json | jq -e --arg c "$MY_IP" \
-    '.[] | select(.protocol=="tcp" and .ports=="22" and .cidr==$c)' >/dev/null 2>&1 \
-  || error "Could not confirm the scoped SSH rule for $MY_IP exists on '$HEADSCALE_NAME'. Not removing the open rule until this is fixed. Check manually: zcp firewall list --ip $IP_SLUG"
-
-# Only now, with a scoped rule confirmed in place, remove the template's
-# default open-to-everyone rule.
-OPEN_SSH_RULES_JSON="$(zcp firewall list --ip "$IP_SLUG" -o json)" || error "Could not list firewall rules for '$HEADSCALE_NAME' (IP slug $IP_SLUG)."
-OPEN_SSH_RULE_IDS="$(echo "$OPEN_SSH_RULES_JSON" | jq -r '.[] | select((.protocol=="tcp" or .protocol=="udp") and .ports=="22" and .cidr=="0.0.0.0/0") | .id')"
-if [ -n "$OPEN_SSH_RULE_IDS" ]; then
-  while read -r rule_id; do
-    [ -n "$rule_id" ] && zcp firewall delete "$rule_id" --ip "$IP_SLUG" --yes
-  done <<< "$OPEN_SSH_RULE_IDS"
-fi
-
 # Defense in depth: a VM built with an older version of this script may still
 # have port 3000 open from before the admin UI moved to SSH-tunnel-only. Close
-# it if found, regardless of how this VM was originally built.
-OPEN_3000_RULE_IDS="$(zcp firewall list --ip "$IP_SLUG" -o json | jq -r '.[] | select(.protocol=="tcp" and .ports=="3000") | .id')"
+# it if found (either protocol, the delete filter matches what the post-condition
+# checks, so a udp/3000 rule can't survive the delete loop and then fail the
+# post-condition forever), regardless of how this VM was originally built.
+OPEN_3000_RULE_IDS="$(zcp firewall list --ip "$IP_SLUG" -o json | jq -r "$JQ_PORT_MATCH"' .[] | select(((.protocol | proto_is("tcp")) or (.protocol | proto_is("udp"))) and (.ports | port_has(3000))) | .id' || true)"
 if [ -n "$OPEN_3000_RULE_IDS" ]; then
   warn "Found an existing port 3000 rule (from an older run or manual change). Removing it. The admin UI is SSH-tunnel-only."
   while read -r rule_id; do
@@ -454,16 +515,14 @@ if [ -n "$OPEN_3000_RULE_IDS" ]; then
   done <<< "$OPEN_3000_RULE_IDS"
 fi
 
-# Post-condition: confirm the default-open SSH rule and port 3000 are both
-# actually gone, rather than trusting the delete loops ran (a failed
-# 'zcp firewall list' above would otherwise leave either exposed while this
-# script reports success).
-STILL_OPEN="$(zcp firewall list --ip "$IP_SLUG" -o json | jq '[.[] | select((.protocol=="tcp" or .protocol=="udp") and (.ports=="22" and .cidr=="0.0.0.0/0" or .ports=="3000"))] | length')"
-[ "$STILL_OPEN" = "0" ] || error "Lockdown failed: $STILL_OPEN rule(s) still expose 0.0.0.0/0 on port 22 or any rule on port 3000 for '$HEADSCALE_NAME'. Check manually: zcp firewall list --ip $IP_SLUG"
+# Post-condition: confirm port 3000 is closed too, on top of what
+# lock_down_ssh already confirmed for port 22.
+STILL_OPEN_3000="$(zcp firewall list --ip "$IP_SLUG" -o json | jq "$JQ_PORT_MATCH"' [.[] | select(((.protocol | proto_is("tcp")) or (.protocol | proto_is("udp"))) and (.ports | port_has(3000)))] | length' || true)"
+[ "$STILL_OPEN_3000" = "0" ] || error "Lockdown failed: $STILL_OPEN_3000 rule(s) still expose port 3000 for '$HEADSCALE_NAME'. Check manually: zcp firewall list --ip $IP_SLUG"
 
 info "Opening port 8080 (mesh control, open to every device that will ever connect)..."
 if ! zcp firewall list --ip "$IP_SLUG" -o json | jq -e \
-    '.[] | select(.protocol=="tcp" and .ports=="8080" and .cidr=="0.0.0.0/0")' >/dev/null 2>&1; then
+    "$JQ_PORT_MATCH"' .[] | select((.protocol | proto_is("tcp")) and (.ports | port_has(8080)) and .cidr=="0.0.0.0/0")' >/dev/null 2>&1; then
   zcp firewall create --ip "$IP_SLUG" --protocol tcp --start-port 8080 --end-port 8080 --cidr 0.0.0.0/0
 fi
 # Prefer checking the real portforward list first (protocol/public_port/vm
@@ -472,7 +531,7 @@ fi
 # failure or a rule pointed at the wrong VM.
 PORTFORWARD_EXISTS="false"
 if zcp portforward list --ip "$IP_SLUG" -o json 2>/dev/null | jq -e --arg vm "$HEADSCALE_SLUG" \
-    '.[] | select(.protocol=="tcp" and (.public_port=="8080" or .public_port==8080) and .vm==$vm)' >/dev/null 2>&1; then
+    "$JQ_PORT_MATCH"' .[] | select((.protocol | proto_is("tcp")) and ((.public_port|tostring)=="8080") and .vm==$vm)' >/dev/null 2>&1; then
   PORTFORWARD_EXISTS="true"
 fi
 if [ "$PORTFORWARD_EXISTS" = "false" ]; then
@@ -518,11 +577,19 @@ else
   success "'$ROUTER_NAME' attached to '$TIER_NAME'"
 fi
 
-ROUTER_INSTANCE_JSON="$(zcp instance get "$ROUTER_SLUG" -o json)"
-ROUTER_IP="$(echo "$ROUTER_INSTANCE_JSON" | jq -r '.[] | select(.field=="Public IP") | .value' | head -1)"
+ROUTER_INSTANCE_JSON="$(zcp instance get "$ROUTER_SLUG" -o json)" || error "Could not look up instance details for '$ROUTER_NAME'."
+ROUTER_IP="$(echo "$ROUTER_INSTANCE_JSON" | jq -r '.[] | select(.field=="Public IP") | .value' | head -1 || true)"
 [ -n "$ROUTER_IP" ] && [ "$ROUTER_IP" != "null" ] || error "Could not determine '$ROUTER_NAME' public IP."
-ROUTER_USER="$(echo "$ROUTER_INSTANCE_JSON" | jq -r '.[] | select(.field=="Username") | .value' | head -1)"
+ROUTER_USER="$(echo "$ROUTER_INSTANCE_JSON" | jq -r '.[] | select(.field=="Username") | .value' | head -1 || true)"
 [ -n "$ROUTER_USER" ] && [ "$ROUTER_USER" != "null" ] || ROUTER_USER="ubuntu"
+# Same ordering rule as Headplane above: lock_down_ssh runs before
+# wait_for_ssh, since it only needs the zcp API, not a live SSH connection.
+ROUTER_IP_SLUG="$(zcp ip list -o json | jq -r --arg vm "$ROUTER_NAME" '.[] | select(.vm==$vm) | .slug' | head -1 || true)"
+[ -n "$ROUTER_IP_SLUG" ] || error "Could not find the public IP slug for '$ROUTER_NAME'."
+
+info "Locking down the template's default open SSH rule..."
+lock_down_ssh "$ROUTER_IP_SLUG" "$ROUTER_NAME"
+
 wait_for_ssh "$ROUTER_IP" "$SSH_WAIT_SECONDS" "$ROUTER_USER"
 
 info "Bringing up the tier NIC (hot-added, not auto-configured by the OS)..."
@@ -531,7 +598,7 @@ info "Bringing up the tier NIC (hot-added, not auto-configured by the OS)..."
 # does on any rerun against an already-configured router. Without this
 # exclusion, 'tail -1' would pick tailscale0 instead of the real tier NIC and
 # overwrite its netplan config).
-TIER_NIC="$(remote "$ROUTER_IP" "ip -br link show | awk '{print \$1}' | grep -v '^lo\$' | grep -v '^enp' | grep -v '^tailscale' | tail -1" "$ROUTER_USER")"
+TIER_NIC="$(remote "$ROUTER_IP" "ip -br link show | awk '{print \$1}' | grep -v '^lo\$' | grep -v '^enp' | grep -v '^tailscale' | tail -1" "$ROUTER_USER" || true)"
 [ -n "$TIER_NIC" ] || error "Could not identify the tier NIC on '$ROUTER_NAME'. Check manually: ssh ${ROUTER_USER}@$ROUTER_IP 'ip -br link show'"
 remote "$ROUTER_IP" "sudo tee /etc/netplan/60-tier-nic.yaml >/dev/null <<EOF
 network:
@@ -542,7 +609,7 @@ network:
 EOF" "$ROUTER_USER"
 remote "$ROUTER_IP" "sudo netplan apply" "$ROUTER_USER"
 sleep 5
-ROUTER_TIER_IP="$(remote "$ROUTER_IP" "ip -4 -br addr show ${TIER_NIC} | awk '{print \$3}' | cut -d/ -f1" "$ROUTER_USER")"
+ROUTER_TIER_IP="$(remote "$ROUTER_IP" "ip -4 -br addr show ${TIER_NIC} | awk '{print \$3}' | cut -d/ -f1" "$ROUTER_USER" || true)"
 [ -n "$ROUTER_TIER_IP" ] || error "Tier NIC did not come up with an address. Check manually: ssh ${ROUTER_USER}@$ROUTER_IP"
 # Belt and suspenders: even with the exclusions above, confirm the address
 # that actually came up is really on the tier, not some other interface that
@@ -560,7 +627,7 @@ remote "$ROUTER_IP" "grep -qxF 'net.ipv4.ip_forward = 1' /etc/sysctl.d/99-tailsc
   sudo sysctl -p /etc/sysctl.d/99-tailscale.conf" "$ROUTER_USER"
 
 info "Minting a preauth key on Headscale..."
-HEADSCALE_USER_ID="$(remote "$HEADSCALE_IP" "sudo docker exec headscale headscale users list -o json" "$HEADSCALE_USER" | jq -r '.[0].id')"
+HEADSCALE_USER_ID="$(remote "$HEADSCALE_IP" "sudo docker exec headscale headscale users list -o json" "$HEADSCALE_USER" | jq -r '.[0].id' || true)"
 [ -n "$HEADSCALE_USER_ID" ] && [ "$HEADSCALE_USER_ID" != "null" ] || error "Could not find a Headscale user. Check manually on $HEADSCALE_IP."
 PREAUTH_KEY="$(remote "$HEADSCALE_IP" "sudo docker exec headscale headscale preauthkeys create --user ${HEADSCALE_USER_ID} --expiration 1h" "$HEADSCALE_USER" || true)"
 [ -n "$PREAUTH_KEY" ] || error "Could not mint a preauth key for '$ROUTER_NAME' on Headscale."
@@ -569,7 +636,7 @@ info "Registering the subnet router and advertising ${TIER_CIDR}..."
 remote "$ROUTER_IP" "sudo tailscale up --login-server http://${HEADSCALE_IP}:8080 --authkey ${PREAUTH_KEY} --advertise-routes=${TIER_CIDR} --accept-routes" "$ROUTER_USER"
 
 info "Approving the advertised route on Headscale..."
-NODE_ID="$(remote "$HEADSCALE_IP" "sudo docker exec headscale headscale nodes list -o json" "$HEADSCALE_USER" | jq -r --arg n "$ROUTER_NAME" '.[] | select(.given_name==$n or .name==$n) | .id' | head -1)"
+NODE_ID="$(remote "$HEADSCALE_IP" "sudo docker exec headscale headscale nodes list -o json" "$HEADSCALE_USER" | jq -r --arg n "$ROUTER_NAME" '.[] | select(.given_name==$n or .name==$n) | .id' | head -1 || true)"
 [ -n "$NODE_ID" ] || error "Could not find the router's node ID in Headscale. Approve manually: docker exec headscale headscale nodes approve-routes --identifier <id> --routes ${TIER_CIDR}"
 remote "$HEADSCALE_IP" "sudo docker exec headscale headscale nodes approve-routes --identifier ${NODE_ID} --routes ${TIER_CIDR}" "$HEADSCALE_USER"
 success "Route approved. '$ROUTER_NAME' is now the door into '$TIER_NAME'."
