@@ -279,8 +279,21 @@ wait_for_ssh() {
 }
 
 remote() {
-  local ip="$1" cmd="$2" user="${3:-ubuntu}"
-  ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "${user}@${ip}" "$cmd"
+  # Retries specifically on ssh's own exit code 255 (a connection-level
+  # failure: timeout, refused, host key issue), never on any other exit
+  # code. A non-255 exit is the remote command's own result and must
+  # propagate immediately, not be masked by a retry. Confirmed live: a
+  # remote() call can transiently time out seconds after the VM was reachable
+  # for the previous check, and recovers instantly on its own with no
+  # underlying problem.
+  local ip="$1" cmd="$2" user="${3:-ubuntu}" attempt status
+  for attempt in 1 2 3; do
+    ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "${user}@${ip}" "$cmd"
+    status=$?
+    [ "$status" -ne 255 ] && return "$status"
+    [ "$attempt" -lt 3 ] && sleep 5
+  done
+  return "$status"
 }
 
 # jq helper: matches a rule's .ports field against a single target port,
@@ -314,9 +327,21 @@ lock_down_ssh() {
       "$JQ_PORT_MATCH"' .[] | select((.protocol | proto_is("tcp")) and (.ports | port_has(22)) and .cidr==$c)' >/dev/null 2>&1; then
     zcp firewall create --ip "$ip_slug" --protocol tcp --start-port 22 --end-port 22 --cidr "$MY_IP"
   fi
-  zcp firewall list --ip "$ip_slug" -o json | jq -e --arg c "$MY_IP" \
-      "$JQ_PORT_MATCH"' .[] | select((.protocol | proto_is("tcp")) and (.ports | port_has(22)) and .cidr==$c)' >/dev/null 2>&1 \
-    || error "Could not confirm the scoped SSH rule for $MY_IP exists on '$vm_label'. Not removing anything until this is fixed. Check manually: zcp firewall list --ip $ip_slug"
+  # The API accepting a create doesn't mean 'firewall list' reflects it
+  # immediately. Confirmed live: a rule created seconds earlier was missing
+  # from the very next list call. Retry a few times before treating a miss as
+  # a real failure, rather than hard-erroring on ordinary propagation lag.
+  local confirmed="false" attempt
+  for attempt in 1 2 3 4 5; do
+    if zcp firewall list --ip "$ip_slug" -o json | jq -e --arg c "$MY_IP" \
+        "$JQ_PORT_MATCH"' .[] | select((.protocol | proto_is("tcp")) and (.ports | port_has(22)) and .cidr==$c)' >/dev/null 2>&1; then
+      confirmed="true"
+      break
+    fi
+    sleep 3
+  done
+  [ "$confirmed" = "true" ] \
+    || error "Could not confirm the scoped SSH rule for $MY_IP exists on '$vm_label' after ${attempt} attempts. Not removing anything until this is fixed. Check manually: zcp firewall list --ip $ip_slug"
 
   # Clean up any scoped rule left over from a previous run with a different
   # MY_IP (your IP can change between runs).
@@ -331,27 +356,37 @@ lock_down_ssh() {
   fi
 
   # Only now, with a working scoped rule confirmed in place, remove the
-  # template's default open-to-everyone rule.
-  local open_json open_ids
-  open_json="$(zcp firewall list --ip "$ip_slug" -o json)" || error "Could not list firewall rules for '$vm_label' (IP slug $ip_slug)."
-  open_ids="$(echo "$open_json" | jq -r "$JQ_PORT_MATCH"' .[] | select(((.protocol | proto_is("tcp")) or (.protocol | proto_is("udp"))) and (.ports | port_has(22)) and .cidr=="0.0.0.0/0") | .id' || true)"
-  if [ -n "$open_ids" ]; then
-    while read -r rule_id; do
-      [ -n "$rule_id" ] && zcp firewall delete "$rule_id" --ip "$ip_slug" --yes
-    done <<< "$open_ids"
-  fi
+  # template's default open-to-everyone rule. Delete and verify are one retry
+  # loop, not delete-once-then-verify-with-retries: confirmed live that a
+  # plain OS template's own default rules aren't all provisioned by the time
+  # the instance reports Running. A rule invisible to the first delete pass
+  # can still appear afterward. Retrying only the check would spin forever
+  # instead of ever deleting the rule that eventually shows up.
+  local still_open open_ids
+  for attempt in 1 2 3 4 5; do
+    open_ids="$(zcp firewall list --ip "$ip_slug" -o json | jq -r "$JQ_PORT_MATCH"' .[] | select(((.protocol | proto_is("tcp")) or (.protocol | proto_is("udp"))) and (.ports | port_has(22)) and .cidr=="0.0.0.0/0") | .id' || true)"
+    if [ -n "$open_ids" ]; then
+      while read -r rule_id; do
+        [ -n "$rule_id" ] && zcp firewall delete "$rule_id" --ip "$ip_slug" --yes
+      done <<< "$open_ids"
+    fi
+    still_open="$(zcp firewall list --ip "$ip_slug" -o json | jq "$JQ_PORT_MATCH"' [.[] | select(((.protocol | proto_is("tcp")) or (.protocol | proto_is("udp"))) and (.ports | port_has(22)) and .cidr=="0.0.0.0/0")] | length' || true)"
+    [ "$still_open" = "0" ] && break
+    sleep 3
+  done
+  [ "$still_open" = "0" ] || error "Lockdown failed: $still_open rule(s) still expose 0.0.0.0/0 on port 22 for '$vm_label' after ${attempt} attempts. Check manually: zcp firewall list --ip $ip_slug"
 
-  # Post-condition: confirm the default-open rule is actually gone, rather
-  # than trusting the delete loop ran (a failed 'zcp firewall list' above
-  # would otherwise leave it exposed while this function reports success).
-  # Also re-confirm the scoped rule for $MY_IP is still there. Non-vacuous
-  # even on a VM that never had an open rule to begin with.
-  local still_open
-  still_open="$(zcp firewall list --ip "$ip_slug" -o json | jq "$JQ_PORT_MATCH"' [.[] | select(((.protocol | proto_is("tcp")) or (.protocol | proto_is("udp"))) and (.ports | port_has(22)) and .cidr=="0.0.0.0/0")] | length' || true)"
-  [ "$still_open" = "0" ] || error "Lockdown failed: $still_open rule(s) still expose 0.0.0.0/0 on port 22 for '$vm_label'. Check manually: zcp firewall list --ip $ip_slug"
-  zcp firewall list --ip "$ip_slug" -o json | jq -e --arg c "$MY_IP" \
-      "$JQ_PORT_MATCH"' .[] | select((.protocol | proto_is("tcp")) and (.ports | port_has(22)) and .cidr==$c)' >/dev/null 2>&1 \
-    || error "Lockdown failed: the scoped rule for $MY_IP on '$vm_label' is gone after cleanup. Check manually: zcp firewall list --ip $ip_slug"
+  confirmed="false"
+  for attempt in 1 2 3 4 5; do
+    if zcp firewall list --ip "$ip_slug" -o json | jq -e --arg c "$MY_IP" \
+        "$JQ_PORT_MATCH"' .[] | select((.protocol | proto_is("tcp")) and (.ports | port_has(22)) and .cidr==$c)' >/dev/null 2>&1; then
+      confirmed="true"
+      break
+    fi
+    sleep 3
+  done
+  [ "$confirmed" = "true" ] \
+    || error "Lockdown failed: the scoped rule for $MY_IP on '$vm_label' is gone after cleanup (checked ${attempt} times). Check manually: zcp firewall list --ip $ip_slug"
 }
 
 # ---------------------------------------------------------------------------
@@ -499,6 +534,14 @@ until remote "$HEADSCALE_IP" "test -f /etc/headplane/credentials.txt" "$HEADSCAL
 done
 success "First boot complete"
 
+# Confirmed live: SSH can go briefly unreachable in the moments right after
+# the credentials.txt marker file appears, before cloud-init has fully
+# settled (likely a network/docker restart still finishing). A plain remote()
+# retry (a few seconds) wasn't long enough. Re-run the same poll used to
+# wait for SSH the first time, with its full timeout budget, rather than
+# guessing at a fixed delay.
+wait_for_ssh "$HEADSCALE_IP" "$SSH_WAIT_SECONDS" "$HEADSCALE_USER"
+
 info "Repointing server_url at the public IP and restarting the stack..."
 # server_url (Headscale's mesh control endpoint, port 8080) needs the public IP -
 # real remote devices connect to it directly. base_url (the admin UI, port 3000)
@@ -514,18 +557,24 @@ success "Headplane repointed at $HEADSCALE_IP and restarted"
 # it if found (either protocol, the delete filter matches what the post-condition
 # checks, so a udp/3000 rule can't survive the delete loop and then fail the
 # post-condition forever), regardless of how this VM was originally built.
-OPEN_3000_RULE_IDS="$(zcp firewall list --ip "$IP_SLUG" -o json | jq -r "$JQ_PORT_MATCH"' .[] | select(((.protocol | proto_is("tcp")) or (.protocol | proto_is("udp"))) and (.ports | port_has(3000))) | .id' || true)"
-if [ -n "$OPEN_3000_RULE_IDS" ]; then
-  warn "Found an existing port 3000 rule (from an older run or manual change). Removing it. The admin UI is SSH-tunnel-only."
-  while read -r rule_id; do
-    [ -n "$rule_id" ] && zcp firewall delete "$rule_id" --ip "$IP_SLUG" --yes
-  done <<< "$OPEN_3000_RULE_IDS"
-fi
-
-# Post-condition: confirm port 3000 is closed too, on top of what
-# lock_down_ssh already confirmed for port 22.
-STILL_OPEN_3000="$(zcp firewall list --ip "$IP_SLUG" -o json | jq "$JQ_PORT_MATCH"' [.[] | select(((.protocol | proto_is("tcp")) or (.protocol | proto_is("udp"))) and (.ports | port_has(3000)))] | length' || true)"
-[ "$STILL_OPEN_3000" = "0" ] || error "Lockdown failed: $STILL_OPEN_3000 rule(s) still expose port 3000 for '$HEADSCALE_NAME'. Check manually: zcp firewall list --ip $IP_SLUG"
+#
+# Delete and verify are one retry loop, same reasoning as lock_down_ssh's own
+# open-rule cleanup: a rule not visible on the first pass can still show up on
+# a later one, so retrying only the check would spin forever instead of ever
+# deleting it.
+for attempt in 1 2 3 4 5; do
+  OPEN_3000_RULE_IDS="$(zcp firewall list --ip "$IP_SLUG" -o json | jq -r "$JQ_PORT_MATCH"' .[] | select(((.protocol | proto_is("tcp")) or (.protocol | proto_is("udp"))) and (.ports | port_has(3000))) | .id' || true)"
+  if [ -n "$OPEN_3000_RULE_IDS" ]; then
+    warn "Found an existing port 3000 rule (from an older run or manual change). Removing it. The admin UI is SSH-tunnel-only."
+    while read -r rule_id; do
+      [ -n "$rule_id" ] && zcp firewall delete "$rule_id" --ip "$IP_SLUG" --yes
+    done <<< "$OPEN_3000_RULE_IDS"
+  fi
+  STILL_OPEN_3000="$(zcp firewall list --ip "$IP_SLUG" -o json | jq "$JQ_PORT_MATCH"' [.[] | select(((.protocol | proto_is("tcp")) or (.protocol | proto_is("udp"))) and (.ports | port_has(3000)))] | length' || true)"
+  [ "$STILL_OPEN_3000" = "0" ] && break
+  sleep 3
+done
+[ "$STILL_OPEN_3000" = "0" ] || error "Lockdown failed: $STILL_OPEN_3000 rule(s) still expose port 3000 for '$HEADSCALE_NAME' after ${attempt} attempts. Check manually: zcp firewall list --ip $IP_SLUG"
 
 info "Opening port 8080 (mesh control, open to every device that will ever connect)..."
 if ! zcp firewall list --ip "$IP_SLUG" -o json | jq -e \
@@ -637,6 +686,12 @@ esac
 success "Tier NIC ($TIER_NIC) up at $ROUTER_TIER_IP"
 
 info "Installing Tailscale and enabling IP forwarding..."
+# A freshly booted cloud VM's own background package operations (cloud-init,
+# unattended-upgrades) can still hold the dpkg lock. Confirmed live: Tailscale's
+# install script's own apt-get failed with "Could not get lock
+# /var/lib/dpkg/lock-frontend" seconds after SSH became available. Wait for
+# the lock to clear before running anything that needs it, rather than racing it.
+remote "$ROUTER_IP" "for i in \$(seq 1 30); do sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || break; sleep 5; done" "$ROUTER_USER"
 remote "$ROUTER_IP" "curl -fsSL https://tailscale.com/install.sh | sudo sh" "$ROUTER_USER"
 remote "$ROUTER_IP" "grep -qxF 'net.ipv4.ip_forward = 1' /etc/sysctl.d/99-tailscale.conf 2>/dev/null || echo 'net.ipv4.ip_forward = 1' | sudo tee -a /etc/sysctl.d/99-tailscale.conf >/dev/null && \
   grep -qxF 'net.ipv6.conf.all.forwarding = 1' /etc/sysctl.d/99-tailscale.conf 2>/dev/null || echo 'net.ipv6.conf.all.forwarding = 1' | sudo tee -a /etc/sysctl.d/99-tailscale.conf >/dev/null && \

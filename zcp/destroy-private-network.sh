@@ -1,8 +1,12 @@
 #!/bin/bash
 # ZCP Private Network + Headscale Mesh: Teardown
-# Removes the subnet router, the Headplane VM, and the VPC (which removes the
-# tier automatically) for a given --name prefix. Each VM's --network-plan deploy
-# also creates its own standalone network that instance delete never touches.
+# Removes the subnet router, the Headplane VM, the private tier, and the VPC
+# for a given --name prefix. Confirmed live: 'zcp vpc delete' does NOT cascade
+# -delete the tier network on this platform, despite that being the natural
+# assumption. It just hangs and fails with "not confirmed within 30s" while
+# the tier silently blocks it. The tier is deleted explicitly, before the VPC.
+# Each VM's --network-plan deploy also creates its own standalone network that
+# instance delete never touches.
 # This script detects one left behind but can't safely delete it automatically
 # (the zcp CLI has no way to resolve that network by ID to a deletable slug) -
 # it reports what's left and where to find it instead. On a rerun where a VM
@@ -88,6 +92,7 @@ export ZCP_REGION ZCP_PROJECT
 zcp() { command zcp --region "$ZCP_REGION" --project "$ZCP_PROJECT" "$@"; }
 
 VPC_NAME="$NAME_PREFIX"
+TIER_NAME="${NAME_PREFIX}-tier"
 HEADSCALE_NAME="${NAME_PREFIX}-headscale"
 ROUTER_NAME="${NAME_PREFIX}-subnet-router"
 
@@ -212,13 +217,43 @@ else
   warn "'$HEADSCALE_NAME' not found, skipping."
 fi
 
-step "Deleting VPC (removes the private tier automatically)"
+step "Deleting the private tier"
+
+# Must happen before the VPC delete below. 'zcp vpc delete' does not cascade
+# -delete the tier network. Confirmed live: it fails with "not confirmed
+# within 30s" while the tier silently keeps the VPC in use.
+TIER_LIST_JSON="$(zcp network list -o json)" || error "Could not list networks to check whether '$TIER_NAME' exists."
+TIER_MATCHES="$(echo "$TIER_LIST_JSON" | jq --arg n "$TIER_NAME" '[.[] | select(.name==$n)]')"
+TIER_MATCH_COUNT="$(echo "$TIER_MATCHES" | jq 'length')"
+case "$TIER_MATCH_COUNT" in
+  0)
+    warn "'$TIER_NAME' not found, skipping."
+    ;;
+  1)
+    TIER_SLUG="$(echo "$TIER_MATCHES" | jq -r '.[0].slug')"
+    ISSUED_COUNT=$((ISSUED_COUNT + 1))
+    if zcp network delete "$TIER_SLUG" --yes; then
+      success "'$TIER_NAME' deleted"
+      DELETED_COUNT=$((DELETED_COUNT + 1))
+    else
+      warn "Could not delete '$TIER_NAME' ($TIER_SLUG). The VPC delete below will likely fail too until this is resolved. Check manually: zcp network get $TIER_SLUG"
+    fi
+    ;;
+  *)
+    error "Ambiguous: $TIER_MATCH_COUNT networks are named '$TIER_NAME'. This script can't safely tell them apart, and deleting the wrong one is irreversible. Rename or remove the duplicate, then re-run. (zcp network list)"
+    ;;
+esac
+
+step "Deleting VPC"
 
 if [ -n "$VPC_SLUG" ]; then
   ISSUED_COUNT=$((ISSUED_COUNT + 1))
-  zcp vpc delete "$VPC_SLUG" --yes
-  success "'$VPC_NAME' deleted"
-  DELETED_COUNT=$((DELETED_COUNT + 1))
+  if zcp vpc delete "$VPC_SLUG" --yes; then
+    success "'$VPC_NAME' deleted"
+    DELETED_COUNT=$((DELETED_COUNT + 1))
+  else
+    warn "Could not delete VPC '$VPC_NAME'. If the tier delete above also failed or was skipped, that's almost certainly why. Check manually: zcp vpc get $VPC_SLUG"
+  fi
 else
   warn "'$VPC_NAME' not found, skipping."
 fi
@@ -262,7 +297,17 @@ for pair in "$ROUTER_NAME:$ROUTER_NETWORK_ID:$ROUTER_PRESENT" "$HEADSCALE_NAME:$
     UNVERIFIED="${UNVERIFIED}${name} (no network reference captured)"$'\n'
     continue
   fi
-  found="$(zcp ip list -o json | jq -r --arg id "$net_id" '.[] | select(.network_id==$id) | .slug' | head -1)"
+  # Confirmed live: the platform releases a VM's standalone network
+  # asynchronously, a few seconds after the instance/VPC deletes it was
+  # attached to are already confirmed gone. A single immediate check reports
+  # a false leftover for a network that's already in the process of going
+  # away on its own. Retry before concluding it's genuinely left behind.
+  found=""
+  for lo_attempt in 1 2 3 4 5; do
+    found="$(zcp ip list -o json | jq -r --arg id "$net_id" '.[] | select(.network_id==$id) | .slug' | head -1)"
+    [ -z "$found" ] && break
+    sleep 4
+  done
   [ -n "$found" ] && LEFTOVER="${LEFTOVER}${found} (network id: ${net_id})"$'\n'
 done
 
