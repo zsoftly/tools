@@ -383,9 +383,15 @@ TIER_SLUG="$(network_slug_for_name "$TIER_NAME")"
 # ---------------------------------------------------------------------------
 step "Step 6/8: Custom network ACL"
 
-# Checks the actual rule content (protocol/action/traffic-direction/CIDR), not
-# just that 4 rules happen to exist, an unrelated ACL that coincidentally has
-# 4 rules must not be accepted as "already correctly configured".
+# Checks the actual rule content (protocol/action/traffic-direction/CIDR) AND
+# that the ACL has exactly these 4 rules and nothing else. A subset match
+# (just checking the 4 expected rules exist) would accept an ACL that also
+# has an extra, unexpected permissive rule, e.g. an ingress-from-0.0.0.0/0
+# rule sitting alongside the 4 correct ones, as "already correctly locked
+# down", silently leaving that extra hole in place. The 4 expected rules are
+# mutually exclusive by (traffic-direction, cidr), so requiring the total
+# count to be exactly 4 while all 4 are individually present rules out any
+# extra or substituted rule by pigeonhole.
 acl_content_ok() {
   local rules_json
   rules_json="$(zcp acl rules "$VPC_SLUG" "$ACL_NAME" -o json)" 2>/dev/null || return 1
@@ -397,6 +403,7 @@ acl_content_ok() {
         ((.traffic // "") | ascii_downcase) == dir and
         .cidr == cidr
       )] | length >= 1;
+    (length == 4) and
     has_rule("ingress"; $tier) and has_rule("ingress"; $mesh) and
     has_rule("egress"; $tier) and has_rule("egress"; $mesh)
   ' >/dev/null 2>&1
@@ -525,13 +532,22 @@ if ! zcp firewall list --ip "$IP_SLUG" -o json | jq -e \
     "$JQ_PORT_MATCH"' .[] | select((.protocol | proto_is("tcp")) and (.ports | port_has(8080)) and .cidr=="0.0.0.0/0")' >/dev/null 2>&1; then
   zcp firewall create --ip "$IP_SLUG" --protocol tcp --start-port 8080 --end-port 8080 --cidr 0.0.0.0/0
 fi
-# Prefer checking the real portforward list first (protocol/public_port/vm
-# fields, matching this CLI's usual table->JSON naming) over trusting a
-# generic "already exists" style error, which could also match an unrelated
-# failure or a rule pointed at the wrong VM.
+# Prefer checking the real portforward list first (protocol/public_port/
+# private_port/vm/state fields, matching this CLI's usual table->JSON naming)
+# over trusting a generic "already exists" style error, which could also
+# match an unrelated failure or a rule pointed at the wrong VM. Checking
+# public_port and vm alone isn't enough either: a drifted rule with the right
+# public port but the wrong private_port (or one sitting in a non-active
+# state) would pass that check while still being wrong or non-functional.
 PORTFORWARD_EXISTS="false"
 if zcp portforward list --ip "$IP_SLUG" -o json 2>/dev/null | jq -e --arg vm "$HEADSCALE_SLUG" \
-    "$JQ_PORT_MATCH"' .[] | select((.protocol | proto_is("tcp")) and ((.public_port|tostring)=="8080") and .vm==$vm)' >/dev/null 2>&1; then
+    "$JQ_PORT_MATCH"' .[] | select(
+      (.protocol | proto_is("tcp")) and
+      ((.public_port|tostring)=="8080") and
+      ((.private_port|tostring)=="8080") and
+      .vm==$vm and
+      (((.state // "") | ascii_downcase) as $s | ($s == "" or ($s | test("delet|disabl|inactiv|fail|error") | not)))
+    )' >/dev/null 2>&1; then
   PORTFORWARD_EXISTS="true"
 fi
 if [ "$PORTFORWARD_EXISTS" = "false" ]; then
