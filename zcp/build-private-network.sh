@@ -286,10 +286,25 @@ remote() {
   # remote() call can transiently time out seconds after the VM was reachable
   # for the previous check, and recovers instantly on its own with no
   # underlying problem.
+  #
+  # The `set +e`/`set -e` pair around the ssh call is not decorative. Under
+  # `set -e`, most call sites below invoke this function as a bare statement
+  # (not inside an if/until condition or the left side of `||`), and a bare
+  # failing command in that position aborts the whole script immediately,
+  # before `status=$?` on the next line ever runs - this retry loop never
+  # actually executed for those call sites. Verified directly against the
+  # real call-site patterns in this file: bare-statement calls (e.g. the
+  # `netplan apply` / `tailscale up` lines) died on the first 255 with zero
+  # retries without this pair; calls already inside an until-condition or a
+  # `$(... || true)` substitution were unaffected either way, since bash
+  # already suspends errexit for those positions. With the pair, all call
+  # sites get the retry uniformly.
   local ip="$1" cmd="$2" user="${3:-ubuntu}" attempt status
   for attempt in 1 2 3; do
+    set +e
     ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "${user}@${ip}" "$cmd"
     status=$?
+    set -e
     [ "$status" -ne 255 ] && return "$status"
     [ "$attempt" -lt 3 ] && sleep 5
   done
