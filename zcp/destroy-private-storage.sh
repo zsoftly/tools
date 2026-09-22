@@ -139,22 +139,55 @@ esac
 
 step "Checking the data volume"
 
+# The zcp CLI has no way to ask "is volume X attached to VM Y" - 'volume
+# list' exposes no attachment field, and there's no 'volume get'. A bare
+# name match is the best this script can do on its own, and it is not
+# enough on its own: deploy-private-storage.sh explicitly tolerates finding
+# an existing ${name}-data volume attached to something else entirely, which
+# means the same name collision is just as possible here, and deleting the
+# wrong volume is irreversible. So deploy records the exact slugs it
+# positively confirmed (only after its own disk-setup checks succeeded, not
+# just after 'volume attach') to a small local state file, and this script
+# prefers that over a name guess whenever it's present, current, and matches
+# the VM this run actually resolved.
 VOLUME_PRESENT="false"
 VOLUME_SLUG=""
-VOLUME_LIST_JSON="$(zcp volume list -o json)" || error "Could not list volumes to check whether '$VOLUME_NAME' exists."
-VOLUME_MATCHES="$(echo "$VOLUME_LIST_JSON" | jq --arg n "$VOLUME_NAME" '[.[] | select(.name==$n)]')"
-VOLUME_MATCH_COUNT="$(echo "$VOLUME_MATCHES" | jq 'length')"
-case "$VOLUME_MATCH_COUNT" in
-  0) ;;
-  1)
-    VOLUME_PRESENT="true"
-    VOLUME_SLUG="$(echo "$VOLUME_MATCHES" | jq -r '.[0].slug')"
-    [ -n "$VOLUME_SLUG" ] && [ "$VOLUME_SLUG" != "null" ] || error "Found volume '$VOLUME_NAME' but it has no slug in the API response. Check manually: zcp volume list"
-    ;;
-  *)
-    error "Ambiguous: $VOLUME_MATCH_COUNT volumes are named '$VOLUME_NAME'. This script can't safely tell them apart, and deleting the wrong one is irreversible. Rename or remove the duplicate, then re-run. (zcp volume list)"
-    ;;
-esac
+VOLUME_OWNERSHIP_VERIFIED="false"
+STATE_FILE="$HOME/.zcp-private-storage-state/${NAME_PREFIX}.json"
+if [ -f "$STATE_FILE" ]; then
+  STATE_VM_SLUG="$(jq -r '.vm_slug // empty' "$STATE_FILE" 2>/dev/null || true)"
+  STATE_VOLUME_SLUG="$(jq -r '.volume_slug // empty' "$STATE_FILE" 2>/dev/null || true)"
+  STATE_REGION="$(jq -r '.region // empty' "$STATE_FILE" 2>/dev/null || true)"
+  STATE_PROJECT="$(jq -r '.project // empty' "$STATE_FILE" 2>/dev/null || true)"
+  if [ -n "$STATE_VOLUME_SLUG" ] && [ "$STATE_REGION" = "$ZCP_REGION" ] && [ "$STATE_PROJECT" = "$ZCP_PROJECT" ] \
+     && { [ "$VM_PRESENT" != "true" ] || [ "$STATE_VM_SLUG" = "$VM_SLUG" ]; }; then
+    if zcp volume list -o json | jq -e --arg s "$STATE_VOLUME_SLUG" '[.[] | select(.slug==$s)] | length == 1' >/dev/null 2>&1; then
+      VOLUME_PRESENT="true"
+      VOLUME_SLUG="$STATE_VOLUME_SLUG"
+      VOLUME_OWNERSHIP_VERIFIED="true"
+      info "Volume for '$VOLUME_NAME' resolved from deploy's own recorded state (positively confirmed, not a name guess)."
+    else
+      warn "Recorded volume slug '$STATE_VOLUME_SLUG' for '$NAME_PREFIX' no longer exists. Falling back to a name-based lookup."
+    fi
+  fi
+fi
+if [ "$VOLUME_OWNERSHIP_VERIFIED" != "true" ]; then
+  VOLUME_LIST_JSON="$(zcp volume list -o json)" || error "Could not list volumes to check whether '$VOLUME_NAME' exists."
+  VOLUME_MATCHES="$(echo "$VOLUME_LIST_JSON" | jq --arg n "$VOLUME_NAME" '[.[] | select(.name==$n)]')"
+  VOLUME_MATCH_COUNT="$(echo "$VOLUME_MATCHES" | jq 'length')"
+  case "$VOLUME_MATCH_COUNT" in
+    0) ;;
+    1)
+      VOLUME_PRESENT="true"
+      VOLUME_SLUG="$(echo "$VOLUME_MATCHES" | jq -r '.[0].slug')"
+      [ -n "$VOLUME_SLUG" ] && [ "$VOLUME_SLUG" != "null" ] || error "Found volume '$VOLUME_NAME' but it has no slug in the API response. Check manually: zcp volume list"
+      warn "Could not confirm '$VOLUME_NAME' ($VOLUME_SLUG) actually belongs to '$VM_NAME' - no recorded state from deploy was found (or usable) for this --name, so this is a name match only. If this isn't the right volume, Ctrl-C now and check manually: zcp volume list"
+      ;;
+    *)
+      error "Ambiguous: $VOLUME_MATCH_COUNT volumes are named '$VOLUME_NAME'. This script can't safely tell them apart, and deleting the wrong one is irreversible. Rename or remove the duplicate, then re-run. (zcp volume list)"
+      ;;
+  esac
+fi
 
 step "Capturing the VM's network reference before deletion"
 # This only works while the VM still exists. On a rerun after a previous
@@ -267,6 +300,10 @@ if [ "$ISSUED_COUNT" -eq 0 ]; then
   warn "Nothing matched --name '$NAME_PREFIX'. No resources were found or deleted. If you expected something here, check the actual prefix with: zcp instance list"
 elif [ "$DELETED_COUNT" -eq "$ISSUED_COUNT" ]; then
   echo "$DELETED_COUNT resource(s) removed for --name '$NAME_PREFIX'." >&2
+  # The recorded state's only purpose was resolving this exact teardown by
+  # confirmed slug rather than a name guess - stale once everything it
+  # points at is gone.
+  rm -f "$STATE_FILE"
 else
   warn "$ISSUED_COUNT delete(s) issued, only $DELETED_COUNT confirmed. Check the [WARN] lines above for what didn't confirm in time."
 fi

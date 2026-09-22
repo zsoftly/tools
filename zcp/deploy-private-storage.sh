@@ -414,13 +414,14 @@ if ! volume_exists "$VOLUME_NAME"; then
   zcp volume create --name "$VOLUME_NAME" --billing-cycle "$BILLING_CYCLE" \
     --storage-category "$VOLUME_STORAGE_CATEGORY" --size "$VOLUME_SIZE" --vm "$VM_SLUG"
   success "Data volume '$VOLUME_NAME' created and attached (${VOLUME_SIZE}GB)"
+  VOLUME_SLUG="$(slug_for_name "volume" "zcp volume list -o json" "$VOLUME_NAME")"
 else
   # A rerun where a previous attempt created the volume but failed before (or
   # without) attaching it - e.g. the VM had to be recreated after the volume
   # already existed - must not silently leave it unattached. --vm at create
   # time only covers the fresh-create path above.
-  EXISTING_VOLUME_SLUG="$(slug_for_name "volume" "zcp volume list -o json" "$VOLUME_NAME")"
-  if ! ATTACH_OUTPUT="$(zcp volume attach "$EXISTING_VOLUME_SLUG" --vm "$VM_SLUG" 2>&1)"; then
+  VOLUME_SLUG="$(slug_for_name "volume" "zcp volume list -o json" "$VOLUME_NAME")"
+  if ! ATTACH_OUTPUT="$(zcp volume attach "$VOLUME_SLUG" --vm "$VM_SLUG" 2>&1)"; then
     if echo "$ATTACH_OUTPUT" | grep -qi "already"; then
       # "already" here could mean already attached to THIS VM, or to some
       # other VM from an earlier run - 'zcp volume list' doesn't expose
@@ -428,7 +429,7 @@ else
       # blindly: if this volume isn't actually on this VM, Step 2 below fails
       # loudly (no second disk found) rather than silently mounting the root
       # disk's own filesystem.
-      warn "Volume '$VOLUME_NAME' reported as already attached somewhere ($ATTACH_OUTPUT). If Step 2 can't find a second disk, it's attached to a different VM - detach it manually: zcp volume detach $EXISTING_VOLUME_SLUG"
+      warn "Volume '$VOLUME_NAME' reported as already attached somewhere ($ATTACH_OUTPUT). If Step 2 can't find a second disk, it's attached to a different VM - detach it manually: zcp volume detach $VOLUME_SLUG"
     else
       error "Volume '$VOLUME_NAME' exists but could not be attached to '$VM_NAME': $ATTACH_OUTPUT"
     fi
@@ -526,11 +527,17 @@ if [ -z \"\$ROOT_DISK\" ]; then
   echo \"ERROR: could not resolve the parent disk of the root filesystem (\$ROOT_SRC). Refusing to guess which disk is safe to format.\" >&2
   exit 1
 fi
-DATA_DEV=\"/dev/\$(lsblk -dno NAME,TYPE | awk -v root=\"\$ROOT_DISK\" '\$2==\"disk\" && \$1!=root {print \$1; exit}')\"
-if [ -z \"\$DATA_DEV\" ] || [ \"\$DATA_DEV\" = \"/dev/\" ]; then
+NON_ROOT_DISKS=\"\$(lsblk -dno NAME,TYPE | awk -v root=\"\$ROOT_DISK\" '\$2==\"disk\" && \$1!=root {print \$1}')\"
+if [ -z \"\$NON_ROOT_DISKS\" ]; then
   echo 'ERROR: could not identify the data disk (found only the root disk)' >&2
   exit 1
 fi
+NON_ROOT_COUNT=\$(printf '%s\n' \"\$NON_ROOT_DISKS\" | wc -l)
+if [ \"\$NON_ROOT_COUNT\" -gt 1 ]; then
+  echo \"ERROR: found \$NON_ROOT_COUNT non-root disks, expected exactly one. Refusing to guess which one is this script's data volume (a non-default --vm-template, or a leftover disk from outside this script, can cause this). Check manually: lsblk\" >&2
+  exit 1
+fi
+DATA_DEV=\"/dev/\$NON_ROOT_DISKS\"
 CURRENT_MOUNTS=\"\$(lsblk -no MOUNTPOINTS \"\$DATA_DEV\" | tr -d '[:space:]')\"
 if [ -n \"\$CURRENT_MOUNTS\" ] && [ \"\$CURRENT_MOUNTS\" != \"/srv/nfs\" ]; then
   echo \"ERROR: \$DATA_DEV (or a partition on it) is already mounted at '\$CURRENT_MOUNTS', not /srv/nfs. Refusing to touch it.\" >&2
@@ -551,10 +558,26 @@ if [ -z \"\$CURRENT_MOUNTS\" ]; then
 else
   echo \"Data disk: \$DATA_DEV (already mounted at /srv/nfs, this is a rerun)\"
 fi
-if [ -n \"\$(sudo blkid -s TYPE -o value \"\$DATA_DEV\" 2>/dev/null)\" ]; then
-  echo 'Already formatted, skipping mkfs.'
+# wipefs, not blkid -s TYPE: blkid -s TYPE only reports a filesystem sitting
+# directly on the whole disk, and returns empty for a disk that instead has a
+# partition table (GPT/MBR) with no top-level filesystem - even though that
+# disk is very much not blank. wipefs -n reports every signature it finds
+# (filesystem, partition table, RAID superblock, ...) in one pass, so a
+# non-empty result here means \"don't touch it\", not specifically \"has ext4\".
+if [ -n \"\$(sudo wipefs -n \"\$DATA_DEV\" 2>/dev/null)\" ]; then
+  echo 'Already formatted or partitioned, skipping mkfs.'
 else
   sudo mkfs.ext4 -F \"\$DATA_DEV\"
+fi
+# Re-checked after the above rather than assumed: a disk wipefs found a
+# signature on (so mkfs was skipped) is not guaranteed to have a directly
+# mountable filesystem - a partition table alone has no TYPE. Failing loudly
+# here is far better than mounting/fstab-ing a device that isn't actually
+# usable as one.
+DATA_TYPE=\"\$(sudo blkid -s TYPE -o value \"\$DATA_DEV\" 2>/dev/null)\"
+if [ -z \"\$DATA_TYPE\" ]; then
+  echo \"ERROR: \$DATA_DEV has no directly-mountable filesystem (only a partition table or other signature was found, not a TYPE). Refusing to guess how to mount or fstab-configure it. Check manually: sudo wipefs \$DATA_DEV; sudo blkid \$DATA_DEV\" >&2
+  exit 1
 fi
 sudo mkdir -p /srv/nfs
 if ! mountpoint -q /srv/nfs; then
@@ -563,13 +586,16 @@ fi
 sudo mkdir -p \"/srv/nfs/\$SHARE_NAME\"
 # fstab is keyed by filesystem UUID, not the raw device path: the device name
 # can enumerate differently after a reboot, and nofail keeps a missing/changed
-# device from dropping the VM to emergency mode with no SSH.
+# device from dropping the VM to emergency mode with no SSH. The filesystem
+# type is DATA_TYPE, whatever was actually detected above - not hardcoded to
+# ext4, since a recycled volume formatted with something else would otherwise
+# get an fstab entry that silently fails to mount on every future boot.
 DATA_UUID=\"\$(sudo blkid -s UUID -o value \"\$DATA_DEV\")\"
 if [ -z \"\$DATA_UUID\" ]; then
   echo \"ERROR: \$DATA_DEV has no filesystem UUID (blkid returned empty). Refusing to add a blank UUID= line to /etc/fstab.\" >&2
   exit 1
 fi
-grep -qF \"UUID=\$DATA_UUID \" /etc/fstab || echo \"UUID=\$DATA_UUID /srv/nfs ext4 defaults,noatime,nofail 0 2\" | sudo tee -a /etc/fstab >/dev/null
+grep -qF \"UUID=\$DATA_UUID \" /etc/fstab || echo \"UUID=\$DATA_UUID /srv/nfs \$DATA_TYPE defaults,noatime,nofail 0 2\" | sudo tee -a /etc/fstab >/dev/null
 DISKSETUP
 chmod +x \$HOME/storage-disk-setup.sh
 sudo \$HOME/storage-disk-setup.sh '$SHARE_NAME' '$VOLUME_SIZE'
@@ -577,6 +603,19 @@ ds_status=\$?
 rm -f \$HOME/storage-disk-setup.sh
 exit \$ds_status" "$VM_USER"
 success "Data disk formatted and mounted at /srv/nfs, share directory /srv/nfs/$SHARE_NAME ready"
+
+# Recorded locally only now that the disk-setup checks above have positively
+# confirmed this exact volume is genuinely attached to and mounted on this
+# exact VM - not right after 'volume attach' succeeds, since attach alone
+# doesn't prove that. destroy-private-storage.sh reads this, when present, to
+# resolve the volume by its actual recorded slug instead of by name alone:
+# the zcp CLI has no way to ask "is volume X attached to VM Y", so a bare
+# name match is the only fallback destroy has when this file is missing (a
+# different machine than the one deploy ran on, or state cleaned up).
+STATE_DIR="$HOME/.zcp-private-storage-state"
+mkdir -p "$STATE_DIR" 2>/dev/null && cat > "$STATE_DIR/${NAME_PREFIX}.json" <<EOF 2>/dev/null
+{"vm_slug": "$VM_SLUG", "volume_slug": "$VOLUME_SLUG", "region": "$ZCP_REGION", "project": "$ZCP_PROJECT"}
+EOF
 
 # ---------------------------------------------------------------------------
 # Step 3: NFS
@@ -595,10 +634,16 @@ remote "$VM_IP" "sudo chown nobody:nogroup /srv/nfs/$SHARE_NAME && sudo chmod 17
 # tier-address source too, unless build-private-network.sh's 'tailscale up'
 # call is ever changed to pass --snat-subnet-routes=false, in which case it
 # arrives with its real mesh-range (100.64.0.0/10) source instead. The mesh
-# CIDR export exists for that case. Exporting to only the tier CIDR would
-# break the moment that flag changes. root_squash (not no_root_squash) is the
-# safer default. Root on a client does not get root-equivalent access to the
-# share.
+# CIDR export exists for that case, but is NOT a complete fix for it on its
+# own: an NFS export ACL only controls who the server answers, it doesn't
+# give this VM a route back to 100.64.0.0/10 - without SNAT, replies would
+# still go out this VM's default route, not back through the subnet router,
+# and the connection would hang rather than work. Exporting to only the tier
+# CIDR would still be strictly worse (it wouldn't even get this far), so this
+# export stays as-is either way, but --snat-subnet-routes=false on the
+# subnet router needs its own routing fix on this VM to actually work, not
+# just this export. root_squash (not no_root_squash) is the safer default.
+# Root on a client does not get root-equivalent access to the share.
 #
 # Replaces only this share's own line in /etc/exports rather than truncating
 # the whole file: a rerun with a different --share-name than a previous run
