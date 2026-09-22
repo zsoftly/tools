@@ -512,10 +512,14 @@ info "Formatting and mounting the data disk (idempotent: skips an already-format
 # Selection is NOT trusted on the ROOT_DISK name alone: a wrong guess here
 # means running mkfs on the root disk. If PKNAME can't resolve the root
 # disk's parent (e.g. an unpartitioned whole-disk root), this fails loudly
-# instead of guessing one from the device name. The selected DATA_DEV is then
-# independently confirmed to have nothing mounted anywhere on it or its
-# partitions, and to be within an order of magnitude of the requested
-# --volume-size, before mkfs ever runs.
+# instead of guessing one from the device name. Of the remaining non-root
+# disks, exactly one is required - more than one means this script can't
+# tell which is the data volume it attached (a non-default --vm-template
+# with an extra disk, most likely) and it fails loudly rather than guessing.
+# The selected DATA_DEV is then independently confirmed to have nothing
+# mounted anywhere on it or its partitions, and to be within 2x (not just
+# "an order of magnitude") of the requested --volume-size, before mkfs ever
+# runs.
 remote "$VM_IP" "cat > \$HOME/storage-disk-setup.sh <<'DISKSETUP'
 #!/bin/bash
 set -e
@@ -595,7 +599,14 @@ if [ -z \"\$DATA_UUID\" ]; then
   echo \"ERROR: \$DATA_DEV has no filesystem UUID (blkid returned empty). Refusing to add a blank UUID= line to /etc/fstab.\" >&2
   exit 1
 fi
-grep -qF \"UUID=\$DATA_UUID \" /etc/fstab || echo \"UUID=\$DATA_UUID /srv/nfs \$DATA_TYPE defaults,noatime,nofail 0 2\" | sudo tee -a /etc/fstab >/dev/null
+# Replaces any existing /srv/nfs line by mountpoint, not just a same-UUID
+# check: a rerun after the data volume itself was swapped (different UUID)
+# would otherwise leave the old, now-wrong UUID= line in fstab forever
+# alongside the new one, same reasoning as the /etc/exports rewrite above.
+awk '\$2 != \"/srv/nfs\"' /etc/fstab > \$HOME/fstab.new
+echo \"UUID=\$DATA_UUID /srv/nfs \$DATA_TYPE defaults,noatime,nofail 0 2\" >> \$HOME/fstab.new
+sudo cp \"\$HOME/fstab.new\" /etc/fstab
+rm -f \"\$HOME/fstab.new\"
 DISKSETUP
 chmod +x \$HOME/storage-disk-setup.sh
 sudo \$HOME/storage-disk-setup.sh '$SHARE_NAME' '$VOLUME_SIZE'
@@ -604,18 +615,30 @@ rm -f \$HOME/storage-disk-setup.sh
 exit \$ds_status" "$VM_USER"
 success "Data disk formatted and mounted at /srv/nfs, share directory /srv/nfs/$SHARE_NAME ready"
 
-# Recorded locally only now that the disk-setup checks above have positively
-# confirmed this exact volume is genuinely attached to and mounted on this
-# exact VM - not right after 'volume attach' succeeds, since attach alone
-# doesn't prove that. destroy-private-storage.sh reads this, when present, to
-# resolve the volume by its actual recorded slug instead of by name alone:
-# the zcp CLI has no way to ask "is volume X attached to VM Y", so a bare
-# name match is the only fallback destroy has when this file is missing (a
-# different machine than the one deploy ran on, or state cleaned up).
+# Recorded locally only now that the disk-setup checks above have passed -
+# exactly one non-root disk, roughly the requested size, genuinely mounted
+# at /srv/nfs - not right after 'volume attach' succeeds, since attach alone
+# doesn't prove any of that. This is still a name-and-shape match, not a
+# cryptographic one: the zcp CLI exposes no device-level identifier to tie
+# DATA_DEV back to $VOLUME_SLUG. destroy-private-storage.sh reads this, when
+# present, to resolve the volume by its recorded slug instead of by name
+# alone - a bare name match is the only fallback destroy has when this file
+# is missing (a different machine than the one deploy ran on, a different
+# --region/--project, or state cleaned up). Namespaced by region+project as
+# well as --name, so two deployments that reuse the same --name elsewhere
+# don't share (and clobber) one file. Best-effort and non-fatal: a failure
+# here must not cost the deploy Steps 3 and 4, which is why it's wrapped
+# rather than a bare '&&' chain - under set -e, an unwrapped failing command
+# right after a successful '&&' still aborts the whole script even though
+# the intent here is clearly "don't let this part block on failure".
 STATE_DIR="$HOME/.zcp-private-storage-state"
-mkdir -p "$STATE_DIR" 2>/dev/null && cat > "$STATE_DIR/${NAME_PREFIX}.json" <<EOF 2>/dev/null
+STATE_FILE="$STATE_DIR/${ZCP_REGION}-${ZCP_PROJECT}-${NAME_PREFIX}.json"
+if ! { mkdir -p "$STATE_DIR" && cat > "$STATE_FILE" <<EOF
 {"vm_slug": "$VM_SLUG", "volume_slug": "$VOLUME_SLUG", "region": "$ZCP_REGION", "project": "$ZCP_PROJECT"}
 EOF
+} 2>/dev/null; then
+  warn "Could not record local state for '$NAME_PREFIX' ($STATE_FILE). destroy-private-storage.sh will still work, but falls back to a name-based match instead of this run's confirmed slugs."
+fi
 
 # ---------------------------------------------------------------------------
 # Step 3: NFS

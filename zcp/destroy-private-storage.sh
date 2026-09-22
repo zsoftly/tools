@@ -145,15 +145,22 @@ step "Checking the data volume"
 # enough on its own: deploy-private-storage.sh explicitly tolerates finding
 # an existing ${name}-data volume attached to something else entirely, which
 # means the same name collision is just as possible here, and deleting the
-# wrong volume is irreversible. So deploy records the exact slugs it
-# positively confirmed (only after its own disk-setup checks succeeded, not
-# just after 'volume attach') to a small local state file, and this script
-# prefers that over a name guess whenever it's present, current, and matches
-# the VM this run actually resolved.
+# wrong volume is irreversible. So deploy records the slugs it resolved
+# (only after its own disk-setup checks succeeded, not just after 'volume
+# attach') to a small local state file, and this script prefers that over a
+# name guess whenever it's present, current, and matches the VM this run
+# actually resolved. Still a name-and-shape match under the hood, not a
+# cryptographic one - see deploy-private-storage.sh's own comment on this -
+# but a strictly stronger one than a bare name lookup with nothing else to
+# go on.
 VOLUME_PRESENT="false"
 VOLUME_SLUG=""
 VOLUME_OWNERSHIP_VERIFIED="false"
-STATE_FILE="$HOME/.zcp-private-storage-state/${NAME_PREFIX}.json"
+# Namespaced by region+project, not just --name: two deployments that reuse
+# the same --name in different regions/projects would otherwise share one
+# state file, and whichever ran deploy most recently would silently clobber
+# the other's record.
+STATE_FILE="$HOME/.zcp-private-storage-state/${ZCP_REGION}-${ZCP_PROJECT}-${NAME_PREFIX}.json"
 if [ -f "$STATE_FILE" ]; then
   STATE_VM_SLUG="$(jq -r '.vm_slug // empty' "$STATE_FILE" 2>/dev/null || true)"
   STATE_VOLUME_SLUG="$(jq -r '.volume_slug // empty' "$STATE_FILE" 2>/dev/null || true)"
@@ -165,9 +172,16 @@ if [ -f "$STATE_FILE" ]; then
       VOLUME_PRESENT="true"
       VOLUME_SLUG="$STATE_VOLUME_SLUG"
       VOLUME_OWNERSHIP_VERIFIED="true"
-      info "Volume for '$VOLUME_NAME' resolved from deploy's own recorded state (positively confirmed, not a name guess)."
+      info "Volume for '$VOLUME_NAME' resolved from deploy's own recorded state, not a name match."
     else
-      warn "Recorded volume slug '$STATE_VOLUME_SLUG' for '$NAME_PREFIX' no longer exists. Falling back to a name-based lookup."
+      # The volume this deploy run actually attached is gone - already
+      # deleted (a prior teardown that got this far but not further, or a
+      # manual delete). That is a confirmed, verified absence, not an
+      # unverifiable situation: falling through to a name match here would
+      # mean deleting a DIFFERENT, merely-same-named volume on the strength
+      # of a record that says this one specific volume no longer exists.
+      VOLUME_OWNERSHIP_VERIFIED="true"
+      info "Volume for '$VOLUME_NAME' (recorded slug '$STATE_VOLUME_SLUG') is already gone. Nothing to delete."
     fi
   fi
 fi
@@ -181,7 +195,7 @@ if [ "$VOLUME_OWNERSHIP_VERIFIED" != "true" ]; then
       VOLUME_PRESENT="true"
       VOLUME_SLUG="$(echo "$VOLUME_MATCHES" | jq -r '.[0].slug')"
       [ -n "$VOLUME_SLUG" ] && [ "$VOLUME_SLUG" != "null" ] || error "Found volume '$VOLUME_NAME' but it has no slug in the API response. Check manually: zcp volume list"
-      warn "Could not confirm '$VOLUME_NAME' ($VOLUME_SLUG) actually belongs to '$VM_NAME' - no recorded state from deploy was found (or usable) for this --name, so this is a name match only. If this isn't the right volume, Ctrl-C now and check manually: zcp volume list"
+      warn "Could not confirm '$VOLUME_NAME' ($VOLUME_SLUG) actually belongs to '$VM_NAME' - no recorded state from deploy was found (or usable) for this --name, so this is a name match only, not a verified one. This script has no confirmation prompt: check 'zcp volume list' first if you have any doubt before running it."
       ;;
     *)
       error "Ambiguous: $VOLUME_MATCH_COUNT volumes are named '$VOLUME_NAME'. This script can't safely tell them apart, and deleting the wrong one is irreversible. Rename or remove the duplicate, then re-run. (zcp volume list)"
