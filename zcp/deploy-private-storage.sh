@@ -3,9 +3,9 @@
 # Runs the ZCP Tutorial 2 workflow (Deploy Private Shared Storage) end to end.
 # Deploys an NFS file share on a VM inside an EXISTING private tier (built by
 # zcp/build-private-network.sh, Tutorial 1). A separate data volume, exported
-# to both the tier CIDR and the Headscale mesh range, reachable only through
-# the mesh. The VM gets a public IP for SSH admin access only; NFS is never
-# exposed on it.
+# to both the tier CIDR and the Headscale mesh range, reachable only from the
+# tier or the mesh. The VM gets a public IP for SSH admin access only; NFS is
+# never exposed on it.
 #
 # Usage:
 #   ./deploy-private-storage.sh --ssh-key my-key --tier-name my-workspace-tier [options]
@@ -422,17 +422,20 @@ else
   # time only covers the fresh-create path above.
   VOLUME_SLUG="$(slug_for_name "volume" "zcp volume list -o json" "$VOLUME_NAME")"
   if ! ATTACH_OUTPUT="$(zcp volume attach "$VOLUME_SLUG" --vm "$VM_SLUG" 2>&1)"; then
-    if echo "$ATTACH_OUTPUT" | grep -qi "already"; then
-      # "already" here could mean already attached to THIS VM, or to some
-      # other VM from an earlier run - 'zcp volume list' doesn't expose
-      # attachment state to tell the two apart ahead of time. Not trusted
-      # blindly: if this volume isn't actually on this VM, Step 2 below fails
-      # loudly (no second disk found) rather than silently mounting the root
-      # disk's own filesystem.
-      warn "Volume '$VOLUME_NAME' reported as already attached somewhere ($ATTACH_OUTPUT). If Step 2 can't find a second disk, it's attached to a different VM - detach it manually: zcp volume detach $VOLUME_SLUG"
-    else
-      error "Volume '$VOLUME_NAME' exists but could not be attached to '$VM_NAME': $ATTACH_OUTPUT"
-    fi
+    # Any failure here is fatal, including "already attached somewhere" -
+    # that phrase could mean already attached to THIS VM (harmless) or to
+    # some OTHER VM entirely (not harmless), and 'zcp volume list' has no way
+    # to tell the two apart ahead of time. Continuing on that ambiguity used
+    # to rely on Step 2's disk-detection catching a wrong-VM case by finding
+    # no second disk - but if this VM happens to carry any OTHER unrelated
+    # non-root disk (a non-default --vm-template, or leftover debris), Step
+    # 2's "exactly one non-root disk" check is satisfied by that unrelated
+    # disk instead, and this volume's slug - possibly still attached
+    # elsewhere - gets recorded in the state file as if it were the one in
+    # use. destroy then trusts that record and deletes someone else's
+    # volume. Erroring out here, rather than guessing, is the only correct
+    # move without a way to positively identify which VM a volume is on.
+    error "Volume '$VOLUME_NAME' ($VOLUME_SLUG) exists but could not be attached to '$VM_NAME': $ATTACH_OUTPUT. If this is 'already attached', the zcp CLI can't confirm to which VM - check manually (zcp volume list, then inspect whichever VM currently holds it) before detaching it and re-running, or use a different --name."
   else
     success "Existing volume '$VOLUME_NAME' attached to '$VM_NAME'"
   fi

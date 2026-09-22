@@ -25,6 +25,7 @@ NAME_PREFIX=""
 DELETE_WAIT_SECONDS=180
 DELETED_COUNT=0
 ISSUED_COUNT=0
+ALLOW_UNVERIFIED_VOLUME_DELETE="false"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -50,6 +51,13 @@ Required:
 Options:
   --region REGION   zcp region slug (or \$ZCP_REGION)
   --project PROJECT zcp project slug (or \$ZCP_PROJECT)
+  --allow-unverified-volume-delete
+                    Required to delete the data volume when deploy's own
+                    recorded state isn't available (a different machine, a
+                    different --region/--project, or state that was never
+                    written or has been cleaned up). Without it, the volume
+                    is left alone and reported rather than deleted on a bare
+                    --name match. The VM itself is still deleted either way.
   -h, --help          Show this help
 
 Example:
@@ -68,6 +76,7 @@ while [[ $# -gt 0 ]]; do
     --region) require_value "$1" "${2:-}"; ZCP_REGION="$2"; shift 2 ;;
     --project) require_value "$1" "${2:-}"; ZCP_PROJECT="$2"; shift 2 ;;
     --name) require_value "$1" "${2:-}"; NAME_PREFIX="$2"; shift 2 ;;
+    --allow-unverified-volume-delete) ALLOW_UNVERIFIED_VOLUME_DELETE="true"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) error "Unknown argument: $1 (see --help)" ;;
   esac
@@ -156,6 +165,7 @@ step "Checking the data volume"
 VOLUME_PRESENT="false"
 VOLUME_SLUG=""
 VOLUME_OWNERSHIP_VERIFIED="false"
+VOLUME_LEFT_UNVERIFIED="false"
 # Namespaced by region+project, not just --name: two deployments that reuse
 # the same --name in different regions/projects would otherwise share one
 # state file, and whichever ran deploy most recently would silently clobber
@@ -168,20 +178,29 @@ if [ -f "$STATE_FILE" ]; then
   STATE_PROJECT="$(jq -r '.project // empty' "$STATE_FILE" 2>/dev/null || true)"
   if [ -n "$STATE_VOLUME_SLUG" ] && [ "$STATE_REGION" = "$ZCP_REGION" ] && [ "$STATE_PROJECT" = "$ZCP_PROJECT" ] \
      && { [ "$VM_PRESENT" != "true" ] || [ "$STATE_VM_SLUG" = "$VM_SLUG" ]; }; then
-    if zcp volume list -o json | jq -e --arg s "$STATE_VOLUME_SLUG" '[.[] | select(.slug==$s)] | length == 1' >/dev/null 2>&1; then
+    # A failure of the list call itself must abort, not fall into the same
+    # branch as a genuine zero-match: a transient API error is not proof the
+    # volume is gone, and treating it as such would skip a real, still-
+    # billable volume and then delete the local record that was the only way
+    # to find it again.
+    STATE_VOLUME_LIST_JSON="$(zcp volume list -o json)" || error "Could not list volumes to check whether the recorded volume '$STATE_VOLUME_SLUG' still exists. Check manually: zcp volume list"
+    STATE_VOLUME_MATCH_COUNT="$(echo "$STATE_VOLUME_LIST_JSON" | jq --arg s "$STATE_VOLUME_SLUG" '[.[] | select(.slug==$s)] | length')"
+    if [ "$STATE_VOLUME_MATCH_COUNT" -eq 1 ]; then
       VOLUME_PRESENT="true"
       VOLUME_SLUG="$STATE_VOLUME_SLUG"
       VOLUME_OWNERSHIP_VERIFIED="true"
       info "Volume for '$VOLUME_NAME' resolved from deploy's own recorded state, not a name match."
-    else
+    elif [ "$STATE_VOLUME_MATCH_COUNT" -eq 0 ]; then
       # The volume this deploy run actually attached is gone - already
       # deleted (a prior teardown that got this far but not further, or a
-      # manual delete). That is a confirmed, verified absence, not an
+      # manual delete). A genuine, successfully-checked absence, not an
       # unverifiable situation: falling through to a name match here would
       # mean deleting a DIFFERENT, merely-same-named volume on the strength
       # of a record that says this one specific volume no longer exists.
       VOLUME_OWNERSHIP_VERIFIED="true"
       info "Volume for '$VOLUME_NAME' (recorded slug '$STATE_VOLUME_SLUG') is already gone. Nothing to delete."
+    else
+      error "Found $STATE_VOLUME_MATCH_COUNT volumes matching the recorded slug '$STATE_VOLUME_SLUG'. This shouldn't happen. Check manually: zcp volume list"
     fi
   fi
 fi
@@ -192,10 +211,22 @@ if [ "$VOLUME_OWNERSHIP_VERIFIED" != "true" ]; then
   case "$VOLUME_MATCH_COUNT" in
     0) ;;
     1)
-      VOLUME_PRESENT="true"
       VOLUME_SLUG="$(echo "$VOLUME_MATCHES" | jq -r '.[0].slug')"
       [ -n "$VOLUME_SLUG" ] && [ "$VOLUME_SLUG" != "null" ] || error "Found volume '$VOLUME_NAME' but it has no slug in the API response. Check manually: zcp volume list"
-      warn "Could not confirm '$VOLUME_NAME' ($VOLUME_SLUG) actually belongs to '$VM_NAME' - no recorded state from deploy was found (or usable) for this --name, so this is a name match only, not a verified one. This script has no confirmation prompt: check 'zcp volume list' first if you have any doubt before running it."
+      # Deploy's own recorded state is unavailable or doesn't apply (a
+      # different machine, a different --region/--project, or state that
+      # was never written or has since been cleaned up), so this is a bare
+      # name match with nothing to verify it against - not proof this
+      # volume belongs to this deployment. Refused by default: deleting on
+      # a name guess alone, with no confirmation prompt in this script, is
+      # exactly the risk deploy's own state file exists to avoid.
+      if [ "$ALLOW_UNVERIFIED_VOLUME_DELETE" = "true" ]; then
+        VOLUME_PRESENT="true"
+        warn "Could not confirm '$VOLUME_NAME' ($VOLUME_SLUG) actually belongs to '$VM_NAME' - proceeding anyway because --allow-unverified-volume-delete was passed."
+      else
+        VOLUME_LEFT_UNVERIFIED="true"
+        warn "Could not confirm '$VOLUME_NAME' ($VOLUME_SLUG) actually belongs to '$VM_NAME' - no recorded state from deploy was found (or usable) for this --name. Leaving it alone. Pass --allow-unverified-volume-delete to delete it anyway on this name match, or verify and delete it yourself: zcp volume detach $VOLUME_SLUG && zcp volume delete $VOLUME_SLUG --yes"
+      fi
       ;;
     *)
       error "Ambiguous: $VOLUME_MATCH_COUNT volumes are named '$VOLUME_NAME'. This script can't safely tell them apart, and deleting the wrong one is irreversible. Rename or remove the duplicate, then re-run. (zcp volume list)"
@@ -268,6 +299,8 @@ if [ "$VOLUME_PRESENT" = "true" ]; then
   else
     warn "Could not delete volume '$VOLUME_NAME' ($VOLUME_SLUG). It may still be attached. Check manually: zcp volume list"
   fi
+elif [ "$VOLUME_LEFT_UNVERIFIED" = "true" ]; then
+  warn "'$VOLUME_NAME' left alone (see the [WARN] above) - not deleted, still billable."
 else
   warn "'$VOLUME_NAME' not found, skipping."
 fi
@@ -310,14 +343,16 @@ if [ -z "$LEFTOVER" ] && [ -z "$UNVERIFIED" ]; then
 fi
 
 step "Done"
-if [ "$ISSUED_COUNT" -eq 0 ]; then
+if [ "$ISSUED_COUNT" -eq 0 ] && [ "$VOLUME_LEFT_UNVERIFIED" != "true" ]; then
   warn "Nothing matched --name '$NAME_PREFIX'. No resources were found or deleted. If you expected something here, check the actual prefix with: zcp instance list"
-elif [ "$DELETED_COUNT" -eq "$ISSUED_COUNT" ]; then
+elif [ "$DELETED_COUNT" -eq "$ISSUED_COUNT" ] && [ "$VOLUME_LEFT_UNVERIFIED" != "true" ]; then
   echo "$DELETED_COUNT resource(s) removed for --name '$NAME_PREFIX'." >&2
   # The recorded state's only purpose was resolving this exact teardown by
   # confirmed slug rather than a name guess - stale once everything it
   # points at is gone.
   rm -f "$STATE_FILE"
+elif [ "$VOLUME_LEFT_UNVERIFIED" = "true" ]; then
+  echo "$DELETED_COUNT resource(s) removed for --name '$NAME_PREFIX'. The data volume was left alone - see the [WARN] lines above." >&2
 else
   warn "$ISSUED_COUNT delete(s) issued, only $DELETED_COUNT confirmed. Check the [WARN] lines above for what didn't confirm in time."
 fi
@@ -337,6 +372,7 @@ fi
 # defeats that for anything scripted against it (CI, automation).
 if [ -n "$LEFTOVER" ] \
    || { [ -n "$UNVERIFIED" ] && [ "$VM_PRESENT" = "true" ]; } \
-   || [ "$DELETED_COUNT" -ne "$ISSUED_COUNT" ]; then
+   || [ "$DELETED_COUNT" -ne "$ISSUED_COUNT" ] \
+   || [ "$VOLUME_LEFT_UNVERIFIED" = "true" ]; then
   exit 2
 fi
