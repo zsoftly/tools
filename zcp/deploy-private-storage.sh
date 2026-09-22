@@ -56,28 +56,28 @@ ZCP Private Shared Storage Deployer
 Usage: $0 --ssh-key <name> --tier-name <tier-name> [options]
 
 Required:
-  --ssh-key NAME      Name of an existing 'zcp ssh-key' entry.
-  --tier-name NAME     The private tier to attach to, e.g. 'my-workspace-tier' from
-                        build-private-network.sh. Not auto-discovered: an account can hold
-                        more than one private tier, and guessing which one is unsafe.
+  --ssh-key NAME    Name of an existing 'zcp ssh-key' entry.
+  --tier-name NAME  The private tier to attach to, e.g. 'my-workspace-tier' from
+                    build-private-network.sh. Not auto-discovered: an account can hold
+                    more than one private tier, and guessing which one is unsafe.
 
 Common overrides (auto-discovered or set to a default value if you leave them out):
-  --region REGION              zcp region slug (or \$ZCP_REGION)
-  --project PROJECT            zcp project slug (or \$ZCP_PROJECT)
-  --name PREFIX                 Base name for the VM and volume (default: storage)
-                                 -> \${PREFIX}, \${PREFIX}-data
-  --share-name NAME              NFS share directory name (default: company-share)
-  --my-ip CIDR                  Your public IP in CIDR form, used to scope admin-port access
-                                 (default: auto-detected via ifconfig.me, with /32 appended)
-  --vm-template SLUG            OS template slug (default: ubuntu-2404-lts-1)
-  --vm-plan SLUG                 Compute plan for the storage VM
-  --network-plan SLUG            Network plan for the VM's public IP
-  --vm-storage-category SLUG     Storage category for the VM's root disk
-  --volume-storage-category SLUG Storage category for the data volume
+  --region REGION                 zcp region slug (or \$ZCP_REGION)
+  --project PROJECT               zcp project slug (or \$ZCP_PROJECT)
+  --name PREFIX                   Base name for the VM and volume (default: storage)
+                                  -> \${PREFIX}, \${PREFIX}-data
+  --share-name NAME               NFS share directory name (default: company-share)
+  --my-ip CIDR                    Your public IP in CIDR form, used to scope admin-port access
+                                  (default: auto-detected via ifconfig.me, with /32 appended)
+  --vm-template SLUG              OS template slug (default: ubuntu-2404-lts-1)
+  --vm-plan SLUG                  Compute plan for the storage VM
+  --network-plan SLUG             Network plan for the VM's public IP
+  --vm-storage-category SLUG      Storage category for the VM's root disk
+  --volume-storage-category SLUG  Storage category for the data volume
   --volume-size GB                Data volume size in GB (default: 20)
   --billing-cycle CYCLE           hourly or monthly (default: hourly)
   -y, --yes                       Skip the "resources about to be created" confirmation prompt
-  -h, --help                       Show this help
+  -h, --help                      Show this help
 
 If you omit a flag, the script looks up a default with 'zcp plan' or 'zcp storage-category' and
 prints what it picked. Pass the flag explicitly to skip the lookup and pin your own value.
@@ -190,6 +190,14 @@ if ! [[ "$TIER_CIDR" =~ ^${OCTET_RE}\.${OCTET_RE}\.${OCTET_RE}\.${OCTET_RE}/${PR
 fi
 info "Tier '$TIER_NAME' found: $TIER_CIDR"
 
+if [ -n "$MY_IP" ]; then
+  # User-supplied, checked with the same OCTET_RE/PREFIX_RE pair as TIER_CIDR
+  # above: MY_IP is interpolated straight into firewall rules below, so an
+  # unvalidated value would reach the zcp/ufw calls unchecked.
+  if ! [[ "$MY_IP" =~ ^${OCTET_RE}\.${OCTET_RE}\.${OCTET_RE}\.${OCTET_RE}/${PREFIX_RE}$ ]]; then
+    error "--my-ip '$MY_IP' must be a valid IPv4 CIDR, including the prefix (e.g. 203.0.113.5/32)."
+  fi
+fi
 if [ -z "$MY_IP" ]; then
   info "Detecting your public IP..."
   DETECTED_IP="$(curl -4 -fsSL https://ifconfig.me)" || error "Could not detect your public IP. Pass --my-ip explicitly."
@@ -219,12 +227,12 @@ VOLUME_STORAGE_CATEGORY="$(resolve "$VOLUME_STORAGE_CATEGORY" "volume storage ca
 
 info "Resolved resources:"
 echo "    Tier                     : $TIER_NAME ($TIER_CIDR)" >&2
-echo "    VM template               : $VM_TEMPLATE" >&2
-echo "    VM plan                   : $VM_PLAN" >&2
-echo "    Network plan               : $NETWORK_PLAN" >&2
-echo "    VM storage category        : $VM_STORAGE_CATEGORY" >&2
-echo "    Volume storage category     : $VOLUME_STORAGE_CATEGORY" >&2
-echo "    Volume size                  : ${VOLUME_SIZE}GB" >&2
+echo "    VM template              : $VM_TEMPLATE" >&2
+echo "    VM plan                  : $VM_PLAN" >&2
+echo "    Network plan             : $NETWORK_PLAN" >&2
+echo "    VM storage category      : $VM_STORAGE_CATEGORY" >&2
+echo "    Volume storage category  : $VOLUME_STORAGE_CATEGORY" >&2
+echo "    Volume size              : ${VOLUME_SIZE}GB" >&2
 
 if [ "$AUTO_YES" != "true" ]; then
   echo "" >&2
@@ -543,7 +551,7 @@ if [ -z \"\$CURRENT_MOUNTS\" ]; then
 else
   echo \"Data disk: \$DATA_DEV (already mounted at /srv/nfs, this is a rerun)\"
 fi
-if sudo blkid \"\$DATA_DEV\" >/dev/null 2>&1; then
+if [ -n \"\$(sudo blkid -s TYPE -o value \"\$DATA_DEV\" 2>/dev/null)\" ]; then
   echo 'Already formatted, skipping mkfs.'
 else
   sudo mkfs.ext4 -F \"\$DATA_DEV\"
@@ -609,7 +617,8 @@ remote "$VM_IP" "set -e
 sudo touch /etc/exports
 grep -vF '/srv/nfs/$SHARE_NAME ' /etc/exports > \$HOME/exports.new 2>/dev/null || true
 echo '$EXPORT_LINE' >> \$HOME/exports.new
-sudo mv \$HOME/exports.new /etc/exports
+sudo cp \"\$HOME/exports.new\" /etc/exports
+rm -f \"\$HOME/exports.new\"
 sudo exportfs -ra" "$VM_USER"
 success "NFS installed, exporting /srv/nfs/$SHARE_NAME to $TIER_CIDR and $MESH_CIDR"
 
@@ -630,7 +639,18 @@ step "Step 4/4: Open the OS firewall, scoped the same way"
 # error propagation between lines, only the last line's exit status counts
 # otherwise. Port 22 is allowed first, before anything else, so SSH is
 # guaranteed permitted before ufw is ever enabled.
+#
+# Stale rules from a previous run against a different --tier-name are removed
+# first, same reasoning as lock_down_ssh's stale-CIDR cleanup above: rerunning
+# against a different tier must not leave the old tier's allow rules in
+# place forever. 'ufw status numbered' is parsed for allow-tcp rules on the
+# three NFS ports whose source CIDR is neither today's tier nor the mesh
+# range, then deleted highest rule number first, since ufw renumbers
+# remaining rules downward after each delete and the numbers were all
+# gathered from a single snapshot up front.
 remote "$VM_IP" "set -e
+STALE_UFW_IDS=\$(sudo ufw status numbered | sed -En 's/^\[[[:space:]]*([0-9]+)\][[:space:]]+([0-9]+)\/tcp[[:space:]]+ALLOW IN[[:space:]]+([0-9.]+\/[0-9]+)[[:space:]]*\$/\1 \2 \3/p' | awk -v t=\"$TIER_CIDR\" -v m=\"$MESH_CIDR\" '(\$2==2049 || \$2==111 || \$2==20048) && \$3!=t && \$3!=m {print \$1}' | sort -rn)
+for id in \$STALE_UFW_IDS; do sudo ufw --force delete \"\$id\"; done
 sudo ufw allow 22/tcp
 sudo ufw allow from $TIER_CIDR to any port 2049 proto tcp
 sudo ufw allow from $TIER_CIDR to any port 111 proto tcp
