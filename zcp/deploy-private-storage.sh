@@ -422,20 +422,31 @@ else
   # time only covers the fresh-create path above.
   VOLUME_SLUG="$(slug_for_name "volume" "zcp volume list -o json" "$VOLUME_NAME")"
   if ! ATTACH_OUTPUT="$(zcp volume attach "$VOLUME_SLUG" --vm "$VM_SLUG" 2>&1)"; then
-    # Any failure here is fatal, including "already attached somewhere" -
-    # that phrase could mean already attached to THIS VM (harmless) or to
-    # some OTHER VM entirely (not harmless), and 'zcp volume list' has no way
-    # to tell the two apart ahead of time. Continuing on that ambiguity used
-    # to rely on Step 2's disk-detection catching a wrong-VM case by finding
-    # no second disk - but if this VM happens to carry any OTHER unrelated
-    # non-root disk (a non-default --vm-template, or leftover debris), Step
-    # 2's "exactly one non-root disk" check is satisfied by that unrelated
-    # disk instead, and this volume's slug - possibly still attached
-    # elsewhere - gets recorded in the state file as if it were the one in
-    # use. destroy then trusts that record and deletes someone else's
-    # volume. Erroring out here, rather than guessing, is the only correct
-    # move without a way to positively identify which VM a volume is on.
-    error "Volume '$VOLUME_NAME' ($VOLUME_SLUG) exists but could not be attached to '$VM_NAME': $ATTACH_OUTPUT. If this is 'already attached', the zcp CLI can't confirm to which VM - check manually (zcp volume list, then inspect whichever VM currently holds it) before detaching it and re-running, or use a different --name."
+    # "Already attached" could mean already attached to THIS VM (harmless -
+    # e.g. a rerun after a Step 2-4 failure on a prior successful attach) or
+    # to some OTHER VM entirely (not harmless), and 'zcp volume list' has no
+    # way to tell the two apart from the API response alone. The one thing
+    # that CAN tell them apart is this machine's own record of a prior
+    # successful run: if deploy previously reached the point of writing the
+    # state file with this exact vm_slug and volume_slug, "already attached"
+    # is that same pairing being reconciled, not evidence of anything else.
+    # Any other failure, or "already" with no matching record, stays fatal -
+    # guessing wrong here is how a wrong volume's slug ends up in the state
+    # file and destroy later deletes someone else's volume.
+    RERUN_VERIFIED="false"
+    if echo "$ATTACH_OUTPUT" | grep -qi "already"; then
+      RERUN_STATE_FILE="$HOME/.zcp-private-storage-state/${ZCP_REGION}-${ZCP_PROJECT}-${NAME_PREFIX}.json"
+      if [ -f "$RERUN_STATE_FILE" ]; then
+        RERUN_VM_SLUG="$(jq -r '.vm_slug // empty' "$RERUN_STATE_FILE" 2>/dev/null || true)"
+        RERUN_VOLUME_SLUG="$(jq -r '.volume_slug // empty' "$RERUN_STATE_FILE" 2>/dev/null || true)"
+        [ "$RERUN_VM_SLUG" = "$VM_SLUG" ] && [ "$RERUN_VOLUME_SLUG" = "$VOLUME_SLUG" ] && RERUN_VERIFIED="true"
+      fi
+    fi
+    if [ "$RERUN_VERIFIED" = "true" ]; then
+      warn "Volume '$VOLUME_NAME' ($VOLUME_SLUG) already attached to '$VM_NAME' - matches this machine's own recorded state from a previous run, continuing."
+    else
+      error "Volume '$VOLUME_NAME' ($VOLUME_SLUG) exists but could not be attached to '$VM_NAME': $ATTACH_OUTPUT. If this is 'already attached', the zcp CLI can't confirm to which VM - check manually (zcp volume list, then inspect whichever VM currently holds it) before detaching it and re-running, or use a different --name."
+    fi
   else
     success "Existing volume '$VOLUME_NAME' attached to '$VM_NAME'"
   fi
@@ -640,7 +651,7 @@ if ! { mkdir -p "$STATE_DIR" && cat > "$STATE_FILE" <<EOF
 {"vm_slug": "$VM_SLUG", "volume_slug": "$VOLUME_SLUG", "region": "$ZCP_REGION", "project": "$ZCP_PROJECT"}
 EOF
 } 2>/dev/null; then
-  warn "Could not record local state for '$NAME_PREFIX' ($STATE_FILE). destroy-private-storage.sh will still work, but falls back to a name-based match instead of this run's confirmed slugs."
+  warn "Could not record local state for '$NAME_PREFIX' ($STATE_FILE). destroy-private-storage.sh will still remove the VM, but without this run's confirmed slugs it refuses to delete the data volume on a bare name match - pass --allow-unverified-volume-delete to destroy-private-storage.sh, or verify and delete it yourself."
 fi
 
 # ---------------------------------------------------------------------------
