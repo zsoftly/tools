@@ -52,12 +52,16 @@ Options:
   --region REGION   zcp region slug (or \$ZCP_REGION)
   --project PROJECT zcp project slug (or \$ZCP_PROJECT)
   --allow-unverified-volume-delete
-                    Required to delete the data volume when deploy's own
-                    recorded state isn't available (a different machine, a
-                    different --region/--project, or state that was never
-                    written or has been cleaned up). Without it, the volume
-                    is left alone and reported rather than deleted on a bare
-                    --name match. The VM itself is still deleted either way.
+                    Required to actually delete the data volume. This script
+                    can identify which volume to target, either from deploy's
+                    own recorded state or (with nothing recorded - a different
+                    machine, a different --region/--project, or state that
+                    was never written or has been cleaned up) a bare --name
+                    match, but it has no way to confirm the volume's current
+                    attachment either way: the zcp CLI doesn't expose it.
+                    Without this flag, the volume is left alone and reported
+                    rather than deleted. The VM itself is still deleted
+                    either way.
   -h, --help          Show this help
 
 Example:
@@ -168,12 +172,11 @@ step "Checking the data volume"
 # from manually detaching it and reattaching it elsewhere afterward, and
 # with no attachment field anywhere in this CLI (checked 'volume list',
 # 'instance get', and 'instance list' - none of them expose it), there is
-# no way to check for that before deleting. This script warns loudly at the
-# point of the state match rather than silently trusting it, but still
-# proceeds without an extra flag: requiring one on every ordinary teardown,
-# to guard against an out-of-band action this tutorial never asks a reader
-# to take, would make the flag routine enough that nobody would read it
-# before typing it.
+# no way to check for that before deleting. So a state match is treated the
+# same as a bare name match for the purpose of the actual delete: it still
+# picks the right slug to target, but --allow-unverified-volume-delete is
+# required either way before detaching or deleting it, since neither path
+# can confirm current attachment and getting it wrong is irreversible.
 VOLUME_PRESENT="false"
 VOLUME_SLUG=""
 VOLUME_OWNERSHIP_VERIFIED="false"
@@ -198,11 +201,18 @@ if [ -f "$STATE_FILE" ]; then
     STATE_VOLUME_LIST_JSON="$(zcp volume list -o json)" || error "Could not list volumes to check whether the recorded volume '$STATE_VOLUME_SLUG' still exists. Check manually: zcp volume list"
     STATE_VOLUME_MATCH_COUNT="$(echo "$STATE_VOLUME_LIST_JSON" | jq --arg s "$STATE_VOLUME_SLUG" '[.[] | select(.slug==$s)] | length')"
     if [ "$STATE_VOLUME_MATCH_COUNT" -eq 1 ]; then
-      VOLUME_PRESENT="true"
       VOLUME_SLUG="$STATE_VOLUME_SLUG"
       VOLUME_OWNERSHIP_VERIFIED="true"
       info "Volume for '$VOLUME_NAME' resolved from deploy's own recorded state, not a name match."
-      warn "This confirms the volume's identity, not its current attachment - the zcp CLI has no way to check whether it's been reattached elsewhere since deploy ran. About to detach and delete it on that assumption."
+      # Identity confirmed, current attachment not - see the comment above
+      # this block. Fails closed exactly like the bare-name-match case below.
+      if [ "$ALLOW_UNVERIFIED_VOLUME_DELETE" = "true" ]; then
+        VOLUME_PRESENT="true"
+        warn "Could not confirm '$VOLUME_NAME' ($VOLUME_SLUG) is still attached to '$VM_NAME' right now (only that deploy attached it here once) - proceeding anyway because --allow-unverified-volume-delete was passed."
+      else
+        VOLUME_LEFT_UNVERIFIED="true"
+        warn "Could not confirm '$VOLUME_NAME' ($VOLUME_SLUG) is still attached to '$VM_NAME' right now (only that deploy attached it here once) - the zcp CLI can't check current attachment. Leaving it alone. Pass --allow-unverified-volume-delete to delete it anyway, or verify and delete it yourself: zcp volume detach $VOLUME_SLUG && zcp volume delete $VOLUME_SLUG --yes"
+      fi
     elif [ "$STATE_VOLUME_MATCH_COUNT" -eq 0 ]; then
       # The volume this deploy run actually attached is gone - already
       # deleted (a prior teardown that got this far but not further, or a
