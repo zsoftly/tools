@@ -2,9 +2,14 @@
 # ZCP Private Shared Storage: Teardown
 # Removes the storage VM and its data volume for a given --name prefix.
 # The volume is explicitly detached before the VM is deleted, then deleted as
-# its own separate step - this does not rely on any assumption about what
-# 'instance delete' does to a still-attached data volume, since that has not
-# been independently confirmed on this platform. The VM's --network-plan
+# its own separate step, rather than relying on 'instance delete' to handle a
+# still-attached data volume implicitly. Confirmed live on this platform:
+# deleting a VM with a volume still attached (no prior detach) does not
+# delete or corrupt the volume - it comes back cleanly detached, immediately
+# usable and deletable on its own. The explicit detach-then-delete order is
+# kept anyway, since it makes the two operations independently retryable and
+# their outcomes independently reportable, not because skipping it would be
+# unsafe. The VM's --network-plan
 # deploy also creates its own standalone network that instance delete never
 # touches, same as build-private-network.sh's VMs - this script detects one
 # left behind but can't safely delete it automatically (the zcp CLI has no
@@ -267,10 +272,10 @@ fi
 
 step "Detaching the data volume"
 
-# Explicit step, not relying on an unverified assumption about what
-# 'instance delete' does to an attached volume. If both exist, detach first
-# so the volume delete below never depends on how (or whether) instance
-# delete handles an attached disk.
+# Explicit step - see the header comment on why this isn't strictly required
+# for safety, just for independently retryable/reportable outcomes. If both
+# exist, detach first so the volume delete below never depends on how (or
+# whether) instance delete handles an attached disk.
 if [ "$VM_PRESENT" = "true" ] && [ "$VOLUME_PRESENT" = "true" ]; then
   if zcp volume detach "$VOLUME_SLUG"; then
     success "'$VOLUME_NAME' detached from '$VM_NAME'"
@@ -368,6 +373,12 @@ fi
 step "Done"
 if [ "$ISSUED_COUNT" -eq 0 ] && [ "$VOLUME_LEFT_UNVERIFIED" != "true" ]; then
   warn "Nothing matched --name '$NAME_PREFIX'. No resources were found or deleted. If you expected something here, check the actual prefix with: zcp instance list"
+  # Covers both "nothing under this name ever existed" (rm on a nonexistent
+  # path is a no-op) and "the state file's own VM and volume are both
+  # already gone" (a rerun after a prior fully successful teardown, or
+  # manual cleanup) - in both cases there is nothing left for this record to
+  # usefully resolve, so it shouldn't outlive the resources it points to.
+  rm -f "$STATE_FILE"
 elif [ "$DELETED_COUNT" -eq "$ISSUED_COUNT" ] && [ "$VOLUME_LEFT_UNVERIFIED" != "true" ]; then
   echo "$DELETED_COUNT resource(s) removed for --name '$NAME_PREFIX'." >&2
   # The recorded state's only purpose was resolving this exact teardown by

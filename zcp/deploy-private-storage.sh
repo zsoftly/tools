@@ -422,31 +422,26 @@ else
   # time only covers the fresh-create path above.
   VOLUME_SLUG="$(slug_for_name "volume" "zcp volume list -o json" "$VOLUME_NAME")"
   if ! ATTACH_OUTPUT="$(zcp volume attach "$VOLUME_SLUG" --vm "$VM_SLUG" 2>&1)"; then
-    # "Already attached" could mean already attached to THIS VM (harmless -
-    # e.g. a rerun after a Step 2-4 failure on a prior successful attach) or
-    # to some OTHER VM entirely (not harmless), and 'zcp volume list' has no
-    # way to tell the two apart from the API response alone. The one thing
-    # that CAN tell them apart is this machine's own record of a prior
-    # successful run: if deploy previously reached the point of writing the
-    # state file with this exact vm_slug and volume_slug, "already attached"
-    # is that same pairing being reconciled, not evidence of anything else.
-    # Any other failure, or "already" with no matching record, stays fatal -
-    # guessing wrong here is how a wrong volume's slug ends up in the state
-    # file and destroy later deletes someone else's volume.
-    RERUN_VERIFIED="false"
-    if echo "$ATTACH_OUTPUT" | grep -qi "already"; then
-      RERUN_STATE_FILE="$HOME/.zcp-private-storage-state/${ZCP_REGION}-${ZCP_PROJECT}-${NAME_PREFIX}.json"
-      if [ -f "$RERUN_STATE_FILE" ]; then
-        RERUN_VM_SLUG="$(jq -r '.vm_slug // empty' "$RERUN_STATE_FILE" 2>/dev/null || true)"
-        RERUN_VOLUME_SLUG="$(jq -r '.volume_slug // empty' "$RERUN_STATE_FILE" 2>/dev/null || true)"
-        [ "$RERUN_VM_SLUG" = "$VM_SLUG" ] && [ "$RERUN_VOLUME_SLUG" = "$VOLUME_SLUG" ] && RERUN_VERIFIED="true"
-      fi
-    fi
-    if [ "$RERUN_VERIFIED" = "true" ]; then
-      warn "Volume '$VOLUME_NAME' ($VOLUME_SLUG) already attached to '$VM_NAME' - matches this machine's own recorded state from a previous run, continuing."
-    else
-      error "Volume '$VOLUME_NAME' ($VOLUME_SLUG) exists but could not be attached to '$VM_NAME': $ATTACH_OUTPUT. If this is 'already attached', the zcp CLI can't confirm to which VM - check manually (zcp volume list, then inspect whichever VM currently holds it) before detaching it and re-running, or use a different --name."
-    fi
+    # Any failure here is fatal, including "already attached somewhere" -
+    # that phrase could mean already attached to THIS VM (harmless) or to
+    # some OTHER VM entirely (not harmless), and 'zcp volume list' has no way
+    # to tell the two apart ahead of time.
+    #
+    # An earlier version of this script trusted a local state file here: if
+    # deploy had previously recorded this exact vm_slug/volume_slug pairing,
+    # "already attached" was treated as that pairing being reconciled rather
+    # than evidence of anything else. That's not actually safe - the state
+    # file only proves what a PAST run intended to attach, not what's
+    # attached now. If this volume was since moved to a different VM, and
+    # some other similarly-sized disk was attached to THIS VM in the
+    # meantime, the recorded slugs still match and this would proceed
+    # straight into Step 2, which selects a data disk by "the one non-root
+    # disk of roughly the right size" - exactly the unrelated disk that's
+    # now sitting here - and formats or exports it. Trusting history over
+    # the platform's own answer right now is how that happens. Erroring out
+    # here, rather than guessing, is the only correct move without a way to
+    # positively identify which VM a volume is on.
+    error "Volume '$VOLUME_NAME' ($VOLUME_SLUG) exists but could not be attached to '$VM_NAME': $ATTACH_OUTPUT. If this is 'already attached', the zcp CLI can't confirm to which VM - check manually (zcp volume list, then inspect whichever VM currently holds it) before detaching it and re-running, or use a different --name."
   else
     success "Existing volume '$VOLUME_NAME' attached to '$VM_NAME'"
   fi
