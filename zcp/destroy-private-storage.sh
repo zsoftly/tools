@@ -162,6 +162,18 @@ step "Checking the data volume"
 # cryptographic one - see deploy-private-storage.sh's own comment on this -
 # but a strictly stronger one than a bare name lookup with nothing else to
 # go on.
+#
+# What this does NOT prove: that the volume is still attached to this VM
+# right now. It proves deploy attached it here once. Nothing stops someone
+# from manually detaching it and reattaching it elsewhere afterward, and
+# with no attachment field anywhere in this CLI (checked 'volume list',
+# 'instance get', and 'instance list' - none of them expose it), there is
+# no way to check for that before deleting. This script warns loudly at the
+# point of the state match rather than silently trusting it, but still
+# proceeds without an extra flag: requiring one on every ordinary teardown,
+# to guard against an out-of-band action this tutorial never asks a reader
+# to take, would make the flag routine enough that nobody would read it
+# before typing it.
 VOLUME_PRESENT="false"
 VOLUME_SLUG=""
 VOLUME_OWNERSHIP_VERIFIED="false"
@@ -190,6 +202,7 @@ if [ -f "$STATE_FILE" ]; then
       VOLUME_SLUG="$STATE_VOLUME_SLUG"
       VOLUME_OWNERSHIP_VERIFIED="true"
       info "Volume for '$VOLUME_NAME' resolved from deploy's own recorded state, not a name match."
+      warn "This confirms the volume's identity, not its current attachment - the zcp CLI has no way to check whether it's been reattached elsewhere since deploy ran. About to detach and delete it on that assumption."
     elif [ "$STATE_VOLUME_MATCH_COUNT" -eq 0 ]; then
       # The volume this deploy run actually attached is gone - already
       # deleted (a prior teardown that got this far but not further, or a
