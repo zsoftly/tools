@@ -41,6 +41,9 @@ SSH_WAIT_SECONDS=180
 # already-baked-in password unrecoverable (see the password-printing note near VM
 # creation below). Raised to match that budget; override with --cloud-init-wait.
 CLOUD_INIT_WAIT_SECONDS=1800
+# How long to wait for the tier NIC to get its DHCP address after netplan apply (see the
+# poll in Step 2). Not a flag: it's a bound on a platform behavior, not a user tuning knob.
+TIER_NIC_WAIT_SECONDS=300
 
 # ---------------------------------------------------------------------------
 # Output helpers (matches deploy-private-storage.sh conventions). All write to
@@ -730,9 +733,22 @@ if ! remote "$VM_IP" "sudo netplan apply" "$VM_USER"; then
   error "Could not apply the netplan config on '$VM_NAME'. VM is billable - check manually: ssh ${VM_USER}@$VM_IP, or clean up with: $CLEANUP_HINT"
 fi
 info "If netplan printed a 'permissions too open' warning above, that's expected and harmless here, not a real problem with the file or the NIC coming up."
-sleep 5
-VM_TIER_IP="$(remote "$VM_IP" "ip -4 -br addr show ${TIER_NIC} | awk '{print \$3}' | cut -d/ -f1" "$VM_USER" || true)"
-[ -n "$VM_TIER_IP" ] || error "Tier NIC did not come up with an address. VM is billable - check manually: ssh ${VM_USER}@$VM_IP, or clean up with: $CLEANUP_HINT"
+# 'netplan apply' returns as soon as the config is loaded, well before DHCP finishes on the
+# tier. Confirmed live: on one run the lease arrived ~130s after the apply (networkd:
+# "DHCPv4 address ... acquired" at 17:13:01 for an apply at 17:10:51), while an earlier
+# version of this script gave up after a fixed 5 second sleep and a single check - failing
+# a healthy deploy with a created, billing VM. Polled against a deadline instead.
+info "Waiting for '$TIER_NIC' to get its tier address (DHCP on the tier can take a couple of minutes)..."
+tier_wait_start=$SECONDS
+VM_TIER_IP=""
+while true; do
+  VM_TIER_IP="$(remote "$VM_IP" "ip -4 -br addr show ${TIER_NIC} | awk '{print \$3}' | cut -d/ -f1" "$VM_USER" || true)"
+  [ -n "$VM_TIER_IP" ] && break
+  if [ $((SECONDS - tier_wait_start)) -ge "$TIER_NIC_WAIT_SECONDS" ]; then
+    error "Tier NIC '$TIER_NIC' did not get an address within ${TIER_NIC_WAIT_SECONDS}s. VM is billable - check manually: ssh ${VM_USER}@$VM_IP 'networkctl status $TIER_NIC', or clean up with: $CLEANUP_HINT"
+  fi
+  sleep 5
+done
 # Belt and suspenders, same reasoning as deploy-private-storage.sh's tier NIC
 # check: even with the interface-name exclusions above, confirm the address
 # that actually came up is really on the tier, not some other interface that
