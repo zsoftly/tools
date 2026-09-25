@@ -82,16 +82,18 @@ Common overrides (auto-discovered or set to a default value if you leave them ou
   --region REGION           zcp region slug (or \$ZCP_REGION)
   --project PROJECT         zcp project slug (or \$ZCP_PROJECT)
   --password PASSWORD       The desktop login's password. If omitted, a strong random
-                            password is generated locally and printed once in the final
-                            summary. If passed explicitly, it may be visible in your
-                            shell history or process list, and must be at least 8
-                            characters using only letters, digits, and
-                            !#%+,./:=?@^_- (it's written into a cloud-init env file
-                            and YAML block scalar verbatim, so anything else risks
-                            breaking or being executed by that file).
-  --my-ip CIDR              Your public IP as a /32 (a single address), used to scope
-                            admin-port access (default: auto-detected via ifconfig.me,
-                            with /32 appended)
+                            password is generated locally and printed before the VM is
+                            created, and again in the final summary. If passed
+                            explicitly, it may be visible in your shell history or
+                            process list, and must be at least 8 characters using only
+                            letters, digits, and !#%+,./:=?@^_- (it's written into a
+                            cloud-init env file and YAML block scalar verbatim, so
+                            anything else risks breaking or being executed by that
+                            file).
+  --my-ip CIDR              Your public IP in CIDR form, used to scope admin-port
+                            access (default: auto-detected via ifconfig.me, with /32
+                            appended). Any value works except 0.0.0.0/0, which would
+                            delete itself right after creation.
   --vm-template SLUG        ubuntukde marketplace template slug
                             (default: first match in 'zcp template list | grep ubuntukde')
   --ssh-wait SECONDS        How long to wait for SSH to come up (default: 180)
@@ -151,6 +153,18 @@ while [[ $# -gt 0 ]]; do
     *) error "Unknown argument: $1 (see --help)" ;;
   esac
 done
+
+# Checked before any zcp call, same as every other flag below: --ssh-wait/--cloud-init-wait
+# feed straight into `[ $((SECONDS - start)) -ge "$timeout" ]`. A non-integer there makes
+# `[` exit 2, and since a failing left operand of `&&` is exempt from `set -e`, the `&&
+# error ...` on the far side of it never runs - the wait loop spins forever instead of
+# timing out, on a VM that's already been created and is billing. Confirmed live.
+if ! [[ "$SSH_WAIT_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+  error "--ssh-wait '$SSH_WAIT_SECONDS' must be a positive whole number of seconds."
+fi
+if ! [[ "$CLOUD_INIT_WAIT_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+  error "--cloud-init-wait '$CLOUD_INIT_WAIT_SECONDS' must be a positive whole number of seconds."
+fi
 
 # Emptiness checked before format, not after: an omitted --name/--username should read as
 # "required" (below), not as a confusing regex-format complaint. Matches
@@ -238,6 +252,13 @@ zcp auth validate >/dev/null 2>&1 || error "zcp CLI is not authenticated. Run 'z
 export ZCP_REGION ZCP_PROJECT
 zcp() { command zcp --region "$ZCP_REGION" --project "$ZCP_PROJECT" "$@"; }
 
+# Built once $VM_NAME/region/project are known, referenced from every "VM is billable"
+# error message below Step 1. Uses the same bash<(curl ...) form as the final summary,
+# not a bare 'destroy-employee-desktop.sh --name ...' call: the teardown script requires
+# --region/--project (it hard-errors without them unless they happen to already be
+# exported in the operator's own shell), so a bare call as printed wouldn't actually run.
+CLEANUP_HINT="bash <(curl -fsSL https://raw.githubusercontent.com/zsoftly/tools/main/zcp/destroy-employee-desktop.sh) --name $VM_NAME --region $ZCP_REGION --project $ZCP_PROJECT"
+
 zcp ssh-key list -o json | jq -e --arg n "$SSH_KEY" '.[] | select(.name==$n)' >/dev/null 2>&1 \
   || error "SSH key '$SSH_KEY' not found in this account (zcp ssh-key list)."
 
@@ -287,12 +308,14 @@ if [ -n "$MY_IP" ]; then
   if ! [[ "$MY_IP" =~ ^${OCTET_RE}\.${OCTET_RE}\.${OCTET_RE}\.${OCTET_RE}/${PREFIX_RE}$ ]]; then
     error "--my-ip '$MY_IP' must be a valid IPv4 CIDR, including the prefix (e.g. 203.0.113.5/32)."
   fi
-  # Anything broader than /32 defeats the whole point of "your own IP" (it's meant to
-  # scope admin access to exactly one machine), and lock_down_ssh's own open-rule
-  # cleanup below would delete a broad rule like this right after creating it,
-  # locking the VM out of SSH entirely after it's already billable. Confirmed live.
-  if [ "${MY_IP##*/}" != "32" ]; then
-    error "--my-ip '$MY_IP' must be a /32 (a single address). Anything broader gets removed by this script's own SSH lockdown, after the VM already exists."
+  # Only the literal 0.0.0.0/0 is actually unsafe here: lock_down_ssh's own open-rule
+  # cleanup matches that exact string (not "anything broader than /32"), so passing it
+  # would delete the very rule this script just created, right after the VM already
+  # exists. Traced lock_down_ssh's own jq filters directly to confirm this - anything
+  # else, including a /24 or a corporate NAT range, is untouched by that cleanup and
+  # works as scoped, same as the sibling scripts in this series already allow.
+  if [ "$MY_IP" = "0.0.0.0/0" ]; then
+    error "--my-ip '0.0.0.0/0' can't be used: it's identical to the rule this script's own SSH lockdown always removes, so it would delete itself right after being created. Use your actual public IP or a real range that doesn't include it."
   fi
 fi
 if [ -z "$MY_IP" ]; then
@@ -431,13 +454,13 @@ instance_exists() {
 
 slug_for_name() {
   local label="$1" list_cmd="$2" name="$3" list_json matches count
-  list_json="$(eval "$list_cmd")" || error "Could not list ${label}s to resolve the slug for '$name'."
+  list_json="$(eval "$list_cmd")" || error "Could not list ${label}s to resolve the slug for '$name'. VM is billable - clean up with: $CLEANUP_HINT"
   matches="$(echo "$list_json" | jq --arg n "$name" '[(. // [])[] | select(.name==$n)]')"
   count="$(echo "$matches" | jq 'length')"
   case "$count" in
-    0) error "No $label named '$name' found after creation. This shouldn't happen, check manually: $list_cmd" ;;
+    0) error "No $label named '$name' found after creation. This shouldn't happen, check manually: $list_cmd. VM is billable - clean up with: $CLEANUP_HINT" ;;
     1) echo "$matches" | jq -r '.[0].slug' ;;
-    *) error "Ambiguous: $count ${label}s are named '$name'. This script can't safely tell them apart, rename or remove the duplicate, then re-run. ($list_cmd)" ;;
+    *) error "Ambiguous: $count ${label}s are named '$name'. This script can't safely tell them apart, rename or remove the duplicate, then re-run. ($list_cmd). VM is billable - clean up with: $CLEANUP_HINT" ;;
   esac
 }
 
@@ -453,7 +476,7 @@ wait_for_ssh() {
   info "Waiting for SSH on $ip..."
   while ! ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
       "${user}@${ip}" true 2>/dev/null; do
-    [ $((SECONDS - start)) -ge "$timeout" ] && error "SSH on $ip did not become ready within ${timeout}s. If this VM was already locked down to a previous --my-ip, and your real IP is different now, add a rule for it manually (zcp firewall create --ip <ip-slug> --protocol tcp --start-port 22 --end-port 22 --cidr <your-ip>/32) and re-run. Raise the timeout with --ssh-wait."
+    [ $((SECONDS - start)) -ge "$timeout" ] && error "SSH on $ip did not become ready within ${timeout}s. If this VM was already locked down to a previous --my-ip, and your real IP is different now, add a rule for it manually (zcp firewall create --ip <ip-slug> --protocol tcp --start-port 22 --end-port 22 --cidr <your-ip>/32) and re-run. Raise the timeout with --ssh-wait. VM is billable - clean up with: $CLEANUP_HINT"
     sleep 5
   done
   success "SSH ready on $ip"
@@ -486,7 +509,7 @@ wait_for_cloud_init_user() {
       return 0
     fi
     if [ $((SECONDS - start)) -ge "$timeout" ]; then
-      error "Cloud-init user '$username' does not exist (or has no human uid >= 1000) on '$VM_NAME' after ${timeout}s. The template's first-boot provisioning may still be running (raise the timeout with --cloud-init-wait and re-run), may have failed, or '$username' may have collided with a pre-existing system account. Check manually: ssh ${user}@$ip 'sudo journalctl -u cloud-final' (or check for an 'invalid desktop username' style error, or 'id $username'). If the account exists and just needs a password reset: ssh ${user}@$ip 'sudo passwd $username'."
+      error "Cloud-init user '$username' does not exist (or has no human uid >= 1000) on '$VM_NAME' after ${timeout}s. The template's first-boot provisioning may still be running (raise the timeout with --cloud-init-wait and re-run), may have failed, or '$username' may have collided with a pre-existing system account. Check manually: ssh ${user}@$ip 'sudo journalctl -u cloud-final' (or check for an 'invalid desktop username' style error, or 'id $username'). If the account exists and just needs a password reset: ssh ${user}@$ip 'sudo passwd $username'. To start over instead: $CLEANUP_HINT"
     fi
     sleep 10
   done
@@ -544,7 +567,7 @@ lock_down_ssh() {
     sleep 3
   done
   [ "$confirmed" = "true" ] \
-    || error "Could not confirm the scoped SSH rule for $MY_IP exists on '$vm_label' after ${attempt} attempts. Not removing anything until this is fixed. Check manually: zcp firewall list --ip $ip_slug"
+    || error "Could not confirm the scoped SSH rule for $MY_IP exists on '$vm_label' after ${attempt} attempts. Not removing anything until this is fixed. Check manually: zcp firewall list --ip $ip_slug. VM is billable - clean up with: $CLEANUP_HINT"
 
   local stale_ids
   stale_ids="$(zcp firewall list --ip "$ip_slug" -o json | jq -r --arg c "$MY_IP" \
@@ -568,7 +591,7 @@ lock_down_ssh() {
     [ "$still_open" = "0" ] && break
     sleep 3
   done
-  [ "$still_open" = "0" ] || error "Lockdown failed: $still_open rule(s) still expose 0.0.0.0/0 on port 22 for '$vm_label' after ${attempt} attempts. Check manually: zcp firewall list --ip $ip_slug"
+  [ "$still_open" = "0" ] || error "Lockdown failed: $still_open rule(s) still expose 0.0.0.0/0 on port 22 for '$vm_label' after ${attempt} attempts. Check manually: zcp firewall list --ip $ip_slug. VM is billable - clean up with: $CLEANUP_HINT"
 
   confirmed="false"
   for attempt in 1 2 3 4 5; do
@@ -580,7 +603,7 @@ lock_down_ssh() {
     sleep 3
   done
   [ "$confirmed" = "true" ] \
-    || error "Lockdown failed: the scoped rule for $MY_IP on '$vm_label' is gone after cleanup (checked ${attempt} times). Check manually: zcp firewall list --ip $ip_slug"
+    || error "Lockdown failed: the scoped rule for $MY_IP on '$vm_label' is gone after cleanup (checked ${attempt} times). Check manually: zcp firewall list --ip $ip_slug. VM is billable - clean up with: $CLEANUP_HINT"
 }
 
 # ---------------------------------------------------------------------------
@@ -613,24 +636,25 @@ EOF
 # IP, and RDP is never opened on the public side at all, so the desktop ends
 # up just as unreachable over RDP publicly as a no-public-IP VM would be.
 if ! instance_exists "$VM_NAME"; then
+  # Printed BEFORE the create call, not after it succeeds: if 'zcp instance create --wait'
+  # itself reports failure (a --wait timeout while KDE first boot is still running, or a
+  # transient API error after the request was actually accepted), the VM can still have
+  # been created anyway, with its cloud-init password already baked in - the error message
+  # below says so explicitly. Printing only on the success path left exactly that failure
+  # mode uncovered; printing here means every reachable outcome of this call, success or
+  # failure, has already shown the password before the call even runs.
+  if [ "$PASSWORD_PROVIDED" = "true" ]; then
+    info "About to create '$VM_NAME' with the password you passed via --password. Nothing below this point can lose it."
+  else
+    warn "About to create '$VM_NAME' with a generated RDP password. SAVE THIS NOW - if the create call below reports failure but the VM was actually created anyway, this is the only place its password is shown: $DESKTOP_PASSWORD"
+  fi
   if ! zcp instance create --name "$VM_NAME" \
     --template "$VM_TEMPLATE" --plan "$VM_PLAN" --billing-cycle "$BILLING_CYCLE" \
     --network-plan "$NETWORK_PLAN" --storage-category "$STORAGE_CATEGORY" \
     --ssh-key "$SSH_KEY" --user-data-file "$USERDATA_FILE" --wait; then
-    error "Could not create '$VM_NAME' (or it didn't reach Running in time). If it was actually created despite that, check 'zcp instance list' and clean up with: destroy-employee-desktop.sh --name $VM_NAME"
+    error "Could not create '$VM_NAME' (or it didn't reach Running in time). If it was actually created despite that, its password is the one printed just above. Check 'zcp instance list' and clean up with: $CLEANUP_HINT"
   fi
   success "'$VM_NAME' created"
-  # From this point on the VM exists and is billing, with its cloud-init password already
-  # baked in - if anything below fails, the local copy of that password (the temp file
-  # above) is gone by the time this script exits. Surfaced now, not only in the final
-  # summary, so a later failure never makes it unrecoverable. Confirmed live: this is a
-  # real, reachable outcome, not a hypothetical - several remote()/API calls below can fail
-  # on a deploy that was otherwise healthy (a slow tier NIC, a transient API error).
-  if [ "$PASSWORD_PROVIDED" = "true" ]; then
-    info "'$VM_NAME' now exists and is billing. Its RDP password is the one you passed with --password - nothing below this point can lose it."
-  else
-    warn "'$VM_NAME' now exists and is billing, with its RDP password already baked in by cloud-init. SAVE THIS NOW - if anything below fails, this is the only place it's shown: $DESKTOP_PASSWORD"
-  fi
 else
   VM_ALREADY_EXISTED="true"
   warn "'$VM_NAME' already exists, skipping creation."
@@ -641,15 +665,15 @@ if ! ADDNET_OUTPUT="$(zcp instance add-network "$VM_SLUG" --network "$TIER_SLUG"
   if echo "$ADDNET_OUTPUT" | grep -qi "already"; then
     warn "Tier network already attached to '$VM_NAME'."
   else
-    error "Failed to attach tier network to '$VM_NAME': $ADDNET_OUTPUT"
+    error "Failed to attach tier network to '$VM_NAME': $ADDNET_OUTPUT. VM is billable - clean up with: $CLEANUP_HINT"
   fi
 else
   success "'$VM_NAME' attached to '$TIER_NAME'"
 fi
 
-VM_INSTANCE_JSON="$(zcp instance get "$VM_SLUG" -o json)" || error "Could not look up instance details for '$VM_NAME'."
+VM_INSTANCE_JSON="$(zcp instance get "$VM_SLUG" -o json)" || error "Could not look up instance details for '$VM_NAME'. VM is billable - clean up with: $CLEANUP_HINT"
 VM_IP="$(echo "$VM_INSTANCE_JSON" | jq -r '.[] | select(.field=="Public IP") | .value' | head -1 || true)"
-[ -n "$VM_IP" ] && [ "$VM_IP" != "null" ] || error "Could not determine '$VM_NAME' public IP."
+[ -n "$VM_IP" ] && [ "$VM_IP" != "null" ] || error "Could not determine '$VM_NAME' public IP. VM is billable - clean up with: $CLEANUP_HINT"
 VM_USER="$(echo "$VM_INSTANCE_JSON" | jq -r '.[] | select(.field=="Username") | .value' | head -1 || true)"
 [ -n "$VM_USER" ] && [ "$VM_USER" != "null" ] || VM_USER="ubuntu"
 info "Desktop VM public IP: $VM_IP"
@@ -657,8 +681,8 @@ info "Desktop VM public IP: $VM_IP"
 # Runs BEFORE wait_for_ssh, same reasoning as build-private-network.sh: only
 # talks to the zcp API, so a rerun from a new $MY_IP reconciles before
 # anything tries to connect, instead of deadlocking against the old rule.
-IP_SLUG="$(zcp ip list -o json | jq -r --arg vm "$VM_NAME" '.[] | select(.vm==$vm) | .slug' | head -1 || true)"
-[ -n "$IP_SLUG" ] || error "Could not find the public IP slug for '$VM_NAME'."
+IP_SLUG="$(zcp ip list -o json | jq -r --arg vm "$VM_NAME" '(. // [])[] | select(.vm==$vm) | .slug' | head -1 || true)"
+[ -n "$IP_SLUG" ] || error "Could not find the public IP slug for '$VM_NAME'. VM is billable - clean up with: $CLEANUP_HINT"
 
 info "Locking down SSH to your own IP (nothing else is ever opened on the public side; RDP stays tier-only)..."
 lock_down_ssh "$IP_SLUG" "$VM_NAME"
@@ -677,7 +701,7 @@ info "Bringing up the tier NIC (hot-added, not auto-configured by the OS)..."
 # enp* - correct interface selection instead comes from the `tail -1` ordering here plus
 # the prefix-aware subnet sanity check further down.
 TIER_NIC="$(remote "$VM_IP" "ip -br link show | awk '{print \$1}' | grep -v '^lo\$' | grep -v '^enp' | grep -v '^tailscale' | tail -1" "$VM_USER" || true)"
-[ -n "$TIER_NIC" ] || error "Could not identify the tier NIC on '$VM_NAME'. VM is billable - check manually: ssh ${VM_USER}@$VM_IP 'ip -br link show', or tear down with: destroy-employee-desktop.sh --name $VM_NAME"
+[ -n "$TIER_NIC" ] || error "Could not identify the tier NIC on '$VM_NAME'. VM is billable - check manually: ssh ${VM_USER}@$VM_IP 'ip -br link show', or clean up with: $CLEANUP_HINT"
 if ! remote "$VM_IP" "sudo tee /etc/netplan/60-tier-nic.yaml >/dev/null <<EOF
 network:
   version: 2
@@ -685,15 +709,15 @@ network:
     ${TIER_NIC}:
       dhcp4: true
 EOF" "$VM_USER"; then
-  error "Could not write the netplan config on '$VM_NAME'. VM is billable - check manually: ssh ${VM_USER}@$VM_IP, or tear down with: destroy-employee-desktop.sh --name $VM_NAME"
+  error "Could not write the netplan config on '$VM_NAME'. VM is billable - check manually: ssh ${VM_USER}@$VM_IP, or clean up with: $CLEANUP_HINT"
 fi
 if ! remote "$VM_IP" "sudo netplan apply" "$VM_USER"; then
-  error "Could not apply the netplan config on '$VM_NAME'. VM is billable - check manually: ssh ${VM_USER}@$VM_IP, or tear down with: destroy-employee-desktop.sh --name $VM_NAME"
+  error "Could not apply the netplan config on '$VM_NAME'. VM is billable - check manually: ssh ${VM_USER}@$VM_IP, or clean up with: $CLEANUP_HINT"
 fi
 info "If netplan printed a 'permissions too open' warning above, that's expected and harmless here, not a real problem with the file or the NIC coming up."
 sleep 5
 VM_TIER_IP="$(remote "$VM_IP" "ip -4 -br addr show ${TIER_NIC} | awk '{print \$3}' | cut -d/ -f1" "$VM_USER" || true)"
-[ -n "$VM_TIER_IP" ] || error "Tier NIC did not come up with an address. VM is billable - check manually: ssh ${VM_USER}@$VM_IP, or tear down with: destroy-employee-desktop.sh --name $VM_NAME"
+[ -n "$VM_TIER_IP" ] || error "Tier NIC did not come up with an address. VM is billable - check manually: ssh ${VM_USER}@$VM_IP, or clean up with: $CLEANUP_HINT"
 # Belt and suspenders, same reasoning as deploy-private-storage.sh's tier NIC
 # check: even with the interface-name exclusions above, confirm the address
 # that actually came up is really on the tier, not some other interface that
@@ -711,7 +735,7 @@ TIER_MASK=$(( TIER_PREFIX == 0 ? 0 : (0xFFFFFFFF << (32 - TIER_PREFIX)) & 0xFFFF
 VM_TIER_IP_INT="$(ip_to_int "$VM_TIER_IP")"
 TIER_NET_INT="$(ip_to_int "$TIER_NET")"
 if [ $(( VM_TIER_IP_INT & TIER_MASK )) -ne $(( TIER_NET_INT & TIER_MASK )) ]; then
-  error "Interface '$TIER_NIC' came up with $VM_TIER_IP, which is not on the tier ($TIER_CIDR). Wrong interface selected. VM is billable - check manually: ssh ${VM_USER}@$VM_IP 'ip -br addr show', or tear down with: destroy-employee-desktop.sh --name $VM_NAME"
+  error "Interface '$TIER_NIC' came up with $VM_TIER_IP, which is not on the tier ($TIER_CIDR). Wrong interface selected. VM is billable - check manually: ssh ${VM_USER}@$VM_IP 'ip -br addr show', or clean up with: $CLEANUP_HINT"
 fi
 success "Tier NIC ($TIER_NIC) up at $VM_TIER_IP"
 
@@ -733,12 +757,20 @@ step "Done"
 # On a rerun against a VM that already existed, cloud-init never re-applied - the password
 # generated/printed this run is NOT the VM's real password (that was set at the VM's
 # original first boot, and the temp file holding it was already deleted by the EXIT trap
-# from that first run). Only ever presented as real when this run actually created the VM.
+# from that first run). This holds even when --password was passed explicitly on this
+# rerun: that value was never actually applied either, so reporting it as current would be
+# just as wrong as reporting a freshly-generated one - both branches get their own message
+# rather than treating "the operator typed a password this run" as the same as "the VM's
+# password is that value".
 if [ "$VM_ALREADY_EXISTED" = "true" ]; then
-  RDP_PASSWORD_SUMMARY="  RDP password : (unchanged -- set at first boot by the original deploy, not recoverable here)"
+  if [ "$PASSWORD_PROVIDED" = "true" ]; then
+    RDP_PASSWORD_SUMMARY="  RDP password : (NOT the value you just passed with --password -- cloud-init never re-ran on this existing VM, so its real password is still whatever was set at first boot, not recoverable here)"
+  else
+    RDP_PASSWORD_SUMMARY="  RDP password : (unchanged -- set at first boot by the original deploy, not recoverable here)"
+  fi
 else
   RDP_PASSWORD_SUMMARY="  RDP password : $DESKTOP_PASSWORD
-                  $([ "$PASSWORD_PROVIDED" = "true" ] && echo "(the password you passed with --password)" || echo "(generated by this script - also printed right after creation above, in case a later step had failed)")"
+                  $([ "$PASSWORD_PROVIDED" = "true" ] && echo "(the password you passed with --password)" || echo "(generated by this script - also printed just before creation above, in case anything after that had failed)")"
 fi
 
 cat <<EOF
