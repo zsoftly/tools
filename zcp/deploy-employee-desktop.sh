@@ -35,7 +35,12 @@ STORAGE_CATEGORY=""
 BILLING_CYCLE="hourly"
 AUTO_YES="false"
 SSH_WAIT_SECONDS=180
-CLOUD_INIT_WAIT_SECONDS=300
+# The tutorial this script ports budgets "~30 minutes total, including first-boot KDE
+# provisioning as its own distinct phase" - a 5-minute default hard-errored on healthy
+# deploys that just took a little longer, leaving a created, billable VM with its
+# already-baked-in password unrecoverable (see the password-printing note near VM
+# creation below). Raised to match that budget; override with --cloud-init-wait.
+CLOUD_INIT_WAIT_SECONDS=1800
 
 # ---------------------------------------------------------------------------
 # Output helpers (matches deploy-private-storage.sh conventions). All write to
@@ -80,14 +85,19 @@ Common overrides (auto-discovered or set to a default value if you leave them ou
                             password is generated locally and printed once in the final
                             summary. If passed explicitly, it may be visible in your
                             shell history or process list, and must be at least 8
-                            characters with no whitespace, newlines, quotes, backticks,
-                            or \$ (letters, digits, and !#%&()*+,./:;<=>?@^_~- allowed) -
-                            it's written into a cloud-init env file and YAML block scalar
-                            verbatim.
-  --my-ip CIDR              Your public IP in CIDR form, used to scope admin-port access
-                            (default: auto-detected via ifconfig.me, with /32 appended)
+                            characters using only letters, digits, and
+                            !#%+,./:=?@^_- (it's written into a cloud-init env file
+                            and YAML block scalar verbatim, so anything else risks
+                            breaking or being executed by that file).
+  --my-ip CIDR              Your public IP as a /32 (a single address), used to scope
+                            admin-port access (default: auto-detected via ifconfig.me,
+                            with /32 appended)
   --vm-template SLUG        ubuntukde marketplace template slug
                             (default: first match in 'zcp template list | grep ubuntukde')
+  --ssh-wait SECONDS        How long to wait for SSH to come up (default: 180)
+  --cloud-init-wait SECONDS How long to wait for cloud-init to finish provisioning the
+                            desktop user - KDE first-boot can take several minutes
+                            (default: 1800)
   --vm-plan SLUG            Compute plan for the desktop VM. 4 vCPU/16GB is a comfortable
                             baseline for a genuinely smooth desktop; 4 vCPU/8GB is usable
                             but noticeably less responsive. If omitted, the smallest plan
@@ -134,6 +144,8 @@ while [[ $# -gt 0 ]]; do
     --network-plan) require_value "$1" "${2:-}"; NETWORK_PLAN="$2"; shift 2 ;;
     --storage-category) require_value "$1" "${2:-}"; STORAGE_CATEGORY="$2"; shift 2 ;;
     --billing-cycle) require_value "$1" "${2:-}"; BILLING_CYCLE="$2"; shift 2 ;;
+    --ssh-wait) require_value "$1" "${2:-}"; SSH_WAIT_SECONDS="$2"; shift 2 ;;
+    --cloud-init-wait) require_value "$1" "${2:-}"; CLOUD_INIT_WAIT_SECONDS="$2"; shift 2 ;;
     -y|--yes) AUTO_YES="true"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) error "Unknown argument: $1 (see --help)" ;;
@@ -189,17 +201,22 @@ for reserved_username in "${RESERVED_USERNAMES[@]}"; do
   fi
 done
 
-# Written into a cloud-init env file (UBUNTUKDE_PASSWORD=...) and interpolated into a YAML
-# literal block scalar below, so it gets the same validation rigor as --username, checked
-# here at parse time rather than left to fail silently later. Confirmed live: a space in
-# --password silently truncates/corrupts the env-file line (silent lockout, undetectable by
-# later checks), and a newline breaks out of the YAML block scalar entirely, letting
-# following lines become real top-level cloud-config keys executed as root at first boot.
-# The generated-password path is unaffected (alphanumeric only by construction) and isn't
-# run through this check.
-PASSWORD_RE='^[A-Za-z0-9!#%&()*+,./:;<=>?@^_~-]{8,}$'
+# Written into a cloud-init env file (UBUNTUKDE_PASSWORD=...) that the template's first-boot
+# script sources with shell semantics, and interpolated into a YAML literal block scalar, so
+# it gets the same validation rigor as --username, checked here at parse time rather than
+# left to fail silently later. Confirmed live: a space silently truncates/corrupts the
+# env-file line, and a newline breaks out of the YAML block scalar entirely, letting
+# following lines become real top-level cloud-config keys executed as root at first boot -
+# both "silent lockout, undetectable by later checks". Also confirmed live, since the file is
+# genuinely shell-sourced: '( ) & ; < >' are shell control operators, not just risky-looking
+# punctuation - '(' aborts the whole source with a syntax error (username never gets set
+# either), '&'/';' silently drop or execute the remainder of the value as a command, and '<'/
+# '>' silently truncate it. '~' is excluded too, since it tilde-expands after '='. None of
+# these are needed for a strong password. The generated-password path is unaffected
+# (alphanumeric only by construction) and isn't run through this check.
+PASSWORD_RE='^[A-Za-z0-9!#%+,./:=?@^_-]{8,}$'
 if [ "$PASSWORD_PROVIDED" = "true" ] && ! [[ "$DESKTOP_PASSWORD" =~ $PASSWORD_RE ]]; then
-  error "--password must be at least 8 characters with no whitespace, newlines, quotes, backticks, or \$ (it's written into a cloud-init env file and YAML block scalar verbatim). Allowed characters: letters, digits, and !#%&()*+,./:;<=>?@^_~-"
+  error "--password must be at least 8 characters using only letters, digits, and !#%+,./:=?@^_- (it's sourced as a shell env file and interpolated into a YAML block scalar verbatim; anything else risks breaking or being executed by that file)."
 fi
 
 # ---------------------------------------------------------------------------
@@ -270,6 +287,13 @@ if [ -n "$MY_IP" ]; then
   if ! [[ "$MY_IP" =~ ^${OCTET_RE}\.${OCTET_RE}\.${OCTET_RE}\.${OCTET_RE}/${PREFIX_RE}$ ]]; then
     error "--my-ip '$MY_IP' must be a valid IPv4 CIDR, including the prefix (e.g. 203.0.113.5/32)."
   fi
+  # Anything broader than /32 defeats the whole point of "your own IP" (it's meant to
+  # scope admin access to exactly one machine), and lock_down_ssh's own open-rule
+  # cleanup below would delete a broad rule like this right after creating it,
+  # locking the VM out of SSH entirely after it's already billable. Confirmed live.
+  if [ "${MY_IP##*/}" != "32" ]; then
+    error "--my-ip '$MY_IP' must be a /32 (a single address). Anything broader gets removed by this script's own SSH lockdown, after the VM already exists."
+  fi
 fi
 if [ -z "$MY_IP" ]; then
   info "Detecting your public IP..."
@@ -337,8 +361,12 @@ UBUNTUKDE_MIN_VERSION="1.0.2"
 VM_TEMPLATE_NAME="$(zcp template list -o json | jq -r --arg s "$VM_TEMPLATE" '.[] | select(.slug==$s) | .name' | head -1)"
 VM_TEMPLATE_VERSION="$(echo "$VM_TEMPLATE_NAME" | jq -Rr 'capture("(?<v>[0-9]+\\.[0-9]+\\.[0-9]+)$").v // empty')"
 [ -n "$VM_TEMPLATE_VERSION" ] || error "Could not determine the ubuntukde template's app version from its name ('$VM_TEMPLATE_NAME'). Check manually: zcp template list"
+# This check runs on an explicitly-passed --vm-template too (VM_TEMPLATE is only
+# resolved from the flag or discovery above, never bypassed) - --vm-template lets you pin
+# a *specific* 1.0.2-or-later template if more than one qualifies, it is not a way around
+# this floor.
 version_ge "$VM_TEMPLATE_VERSION" "$UBUNTUKDE_MIN_VERSION" \
-  || error "ubuntukde template '$VM_TEMPLATE' is version $VM_TEMPLATE_VERSION, older than the validated minimum ($UBUNTUKDE_MIN_VERSION). That version fixes a real bug where snap-confined apps like Firefox/Chromium silently fail to launch over RDP. Pass --vm-template to pin a newer one, or check 'zcp template list' for one."
+  || error "ubuntukde template '$VM_TEMPLATE' is version $VM_TEMPLATE_VERSION, older than the validated minimum ($UBUNTUKDE_MIN_VERSION). That version fixes a real bug where snap-confined apps like Firefox/Chromium silently fail to launch over RDP. Check 'zcp template list' for a 1.0.2-or-later template and pass it with --vm-template - there is no way to deploy an older one with this script."
 
 # --vm-plan default: resolve() alone can't express "smallest plan meeting the documented
 # baseline", so this is a dedicated resolution rather than a generic resolve() call. Fields
@@ -363,10 +391,15 @@ if [ -z "$VM_PLAN" ]; then
   VM_PLAN="$(echo "$VM_PLAN_MATCH" | jq -r '.slug')"
 fi
 # Looked up regardless of whether --vm-plan was passed explicitly or resolved above, so the
-# "Resolved resources" summary always shows real cpu/memory, not just an opaque slug.
+# "Resolved resources" summary always shows real cpu/memory, not just an opaque slug - and so
+# an explicitly-passed --vm-plan that doesn't exist is caught here, with a clear error,
+# instead of surfacing only as a bare 'zcp instance create' failure later. jq on no match
+# emits nothing at all (not null), so '// "?"' would never even fire - checked directly
+# instead.
 VM_PLAN_DETAILS="$(zcp plan vm -o json | jq -r --arg s "$VM_PLAN" '.[] | select(.slug==$s)')"
-VM_PLAN_CPU="$(echo "$VM_PLAN_DETAILS" | jq -r '.cpu // "?"')"
-VM_PLAN_MEMORY="$(echo "$VM_PLAN_DETAILS" | jq -r '.memory // "?"')"
+[ -n "$VM_PLAN_DETAILS" ] || error "VM plan '$VM_PLAN' not found. Check available plans: zcp plan vm"
+VM_PLAN_CPU="$(echo "$VM_PLAN_DETAILS" | jq -r '.cpu')"
+VM_PLAN_MEMORY="$(echo "$VM_PLAN_DETAILS" | jq -r '.memory')"
 
 NETWORK_PLAN="$(resolve "$NETWORK_PLAN" "network plan" "zcp plan network -o json" '.[0].slug')"
 STORAGE_CATEGORY="$(resolve "$STORAGE_CATEGORY" "VM storage category" "zcp storage-category list -o json" '.[0].slug')"
@@ -393,13 +426,13 @@ fi
 instance_exists() {
   local list_json
   list_json="$(zcp instance list -o json)" || error "Could not list instances to check whether '$1' already exists."
-  echo "$list_json" | jq -e --arg n "$1" '.[] | select(.name==$n)' >/dev/null 2>&1
+  echo "$list_json" | jq -e --arg n "$1" '(. // [])[] | select(.name==$n)' >/dev/null 2>&1
 }
 
 slug_for_name() {
   local label="$1" list_cmd="$2" name="$3" list_json matches count
   list_json="$(eval "$list_cmd")" || error "Could not list ${label}s to resolve the slug for '$name'."
-  matches="$(echo "$list_json" | jq --arg n "$name" '[.[] | select(.name==$n)]')"
+  matches="$(echo "$list_json" | jq --arg n "$name" '[(. // [])[] | select(.name==$n)]')"
   count="$(echo "$matches" | jq 'length')"
   case "$count" in
     0) error "No $label named '$name' found after creation. This shouldn't happen, check manually: $list_cmd" ;;
@@ -411,13 +444,16 @@ slug_for_name() {
 instance_slug_for_name() { slug_for_name "instance" "zcp instance list -o json" "$1"; }
 
 wait_for_ssh() {
-  local ip="$1" timeout="$2" user="${3:-ubuntu}" waited=0
+  # Deadline based on the bash SECONDS builtin, not a fixed-per-iteration counter: the ssh
+  # probe itself can take up to its own ConnectTimeout, so a counter that just adds a fixed
+  # increment per loop understates real elapsed time and the actual wall-clock wait can run
+  # well past the number printed in the timeout message. Confirmed live.
+  local ip="$1" timeout="$2" user="${3:-ubuntu}" start=$SECONDS
   ssh-keygen -R "$ip" >/dev/null 2>&1 || true
   info "Waiting for SSH on $ip..."
   while ! ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
       "${user}@${ip}" true 2>/dev/null; do
-    waited=$((waited + 5))
-    [ "$waited" -ge "$timeout" ] && error "SSH on $ip did not become ready within ${timeout}s. If this VM was already locked down to a previous --my-ip, and your real IP is different now, add a rule for it manually (zcp firewall create --ip <ip-slug> --protocol tcp --start-port 22 --end-port 22 --cidr <your-ip>/32) and re-run."
+    [ $((SECONDS - start)) -ge "$timeout" ] && error "SSH on $ip did not become ready within ${timeout}s. If this VM was already locked down to a previous --my-ip, and your real IP is different now, add a rule for it manually (zcp firewall create --ip <ip-slug> --protocol tcp --start-port 22 --end-port 22 --cidr <your-ip>/32) and re-run. Raise the timeout with --ssh-wait."
     sleep 5
   done
   success "SSH ready on $ip"
@@ -438,7 +474,10 @@ wait_for_ssh() {
 # catch every possible collision (it would not, for example, catch a colliding account an
 # operator manually created locally with a UID >= 1000), so it must not be relied on alone.
 wait_for_cloud_init_user() {
-  local ip="$1" username="$2" timeout="$3" user="${4:-ubuntu}" waited=0 uid
+  # Deadline based on SECONDS, same reasoning as wait_for_ssh above: each remote() probe
+  # here can itself take up to 3 retries x ~15s, so a fixed per-iteration counter can badly
+  # understate real elapsed time against the printed timeout.
+  local ip="$1" username="$2" timeout="$3" user="${4:-ubuntu}" start=$SECONDS uid
   info "Waiting for cloud-init to finish provisioning '$username' (first-boot KDE provisioning can take several minutes)..."
   while true; do
     uid="$(remote "$ip" "id -u $username 2>/dev/null" "$user" || true)"
@@ -446,9 +485,8 @@ wait_for_cloud_init_user() {
       success "Cloud-init user '$username' confirmed on '$VM_NAME' (uid $uid)"
       return 0
     fi
-    waited=$((waited + 10))
-    if [ "$waited" -ge "$timeout" ]; then
-      error "Cloud-init user '$username' does not exist (or has no human uid >= 1000) on '$VM_NAME' after ${timeout}s. The template's first-boot provisioning may still be running, may have failed, or '$username' may have collided with a pre-existing system account. Check manually: ssh ${user}@$ip 'sudo journalctl -u cloud-final' (or check for an 'invalid desktop username' style error, or 'id $username')."
+    if [ $((SECONDS - start)) -ge "$timeout" ]; then
+      error "Cloud-init user '$username' does not exist (or has no human uid >= 1000) on '$VM_NAME' after ${timeout}s. The template's first-boot provisioning may still be running (raise the timeout with --cloud-init-wait and re-run), may have failed, or '$username' may have collided with a pre-existing system account. Check manually: ssh ${user}@$ip 'sudo journalctl -u cloud-final' (or check for an 'invalid desktop username' style error, or 'id $username'). If the account exists and just needs a password reset: ssh ${user}@$ip 'sudo passwd $username'."
     fi
     sleep 10
   done
@@ -561,6 +599,8 @@ cat > "$USERDATA_FILE" <<EOF
 #cloud-config
 write_files:
   - path: /etc/zmi/deploy.env
+    permissions: '0600'
+    owner: root:root
     content: |
       UBUNTUKDE_USERNAME=$DESKTOP_USERNAME
       UBUNTUKDE_PASSWORD=$DESKTOP_PASSWORD
@@ -573,11 +613,24 @@ EOF
 # IP, and RDP is never opened on the public side at all, so the desktop ends
 # up just as unreachable over RDP publicly as a no-public-IP VM would be.
 if ! instance_exists "$VM_NAME"; then
-  zcp instance create --name "$VM_NAME" \
+  if ! zcp instance create --name "$VM_NAME" \
     --template "$VM_TEMPLATE" --plan "$VM_PLAN" --billing-cycle "$BILLING_CYCLE" \
     --network-plan "$NETWORK_PLAN" --storage-category "$STORAGE_CATEGORY" \
-    --ssh-key "$SSH_KEY" --user-data-file "$USERDATA_FILE" --wait
+    --ssh-key "$SSH_KEY" --user-data-file "$USERDATA_FILE" --wait; then
+    error "Could not create '$VM_NAME' (or it didn't reach Running in time). If it was actually created despite that, check 'zcp instance list' and clean up with: destroy-employee-desktop.sh --name $VM_NAME"
+  fi
   success "'$VM_NAME' created"
+  # From this point on the VM exists and is billing, with its cloud-init password already
+  # baked in - if anything below fails, the local copy of that password (the temp file
+  # above) is gone by the time this script exits. Surfaced now, not only in the final
+  # summary, so a later failure never makes it unrecoverable. Confirmed live: this is a
+  # real, reachable outcome, not a hypothetical - several remote()/API calls below can fail
+  # on a deploy that was otherwise healthy (a slow tier NIC, a transient API error).
+  if [ "$PASSWORD_PROVIDED" = "true" ]; then
+    info "'$VM_NAME' now exists and is billing. Its RDP password is the one you passed with --password - nothing below this point can lose it."
+  else
+    warn "'$VM_NAME' now exists and is billing, with its RDP password already baked in by cloud-init. SAVE THIS NOW - if anything below fails, this is the only place it's shown: $DESKTOP_PASSWORD"
+  fi
 else
   VM_ALREADY_EXISTED="true"
   warn "'$VM_NAME' already exists, skipping creation."
@@ -624,19 +677,23 @@ info "Bringing up the tier NIC (hot-added, not auto-configured by the OS)..."
 # enp* - correct interface selection instead comes from the `tail -1` ordering here plus
 # the prefix-aware subnet sanity check further down.
 TIER_NIC="$(remote "$VM_IP" "ip -br link show | awk '{print \$1}' | grep -v '^lo\$' | grep -v '^enp' | grep -v '^tailscale' | tail -1" "$VM_USER" || true)"
-[ -n "$TIER_NIC" ] || error "Could not identify the tier NIC on '$VM_NAME'. Check manually: ssh ${VM_USER}@$VM_IP 'ip -br link show'"
-remote "$VM_IP" "sudo tee /etc/netplan/60-tier-nic.yaml >/dev/null <<EOF
+[ -n "$TIER_NIC" ] || error "Could not identify the tier NIC on '$VM_NAME'. VM is billable - check manually: ssh ${VM_USER}@$VM_IP 'ip -br link show', or tear down with: destroy-employee-desktop.sh --name $VM_NAME"
+if ! remote "$VM_IP" "sudo tee /etc/netplan/60-tier-nic.yaml >/dev/null <<EOF
 network:
   version: 2
   ethernets:
     ${TIER_NIC}:
       dhcp4: true
-EOF" "$VM_USER"
-remote "$VM_IP" "sudo netplan apply" "$VM_USER"
+EOF" "$VM_USER"; then
+  error "Could not write the netplan config on '$VM_NAME'. VM is billable - check manually: ssh ${VM_USER}@$VM_IP, or tear down with: destroy-employee-desktop.sh --name $VM_NAME"
+fi
+if ! remote "$VM_IP" "sudo netplan apply" "$VM_USER"; then
+  error "Could not apply the netplan config on '$VM_NAME'. VM is billable - check manually: ssh ${VM_USER}@$VM_IP, or tear down with: destroy-employee-desktop.sh --name $VM_NAME"
+fi
 info "If netplan printed a 'permissions too open' warning above, that's expected and harmless here, not a real problem with the file or the NIC coming up."
 sleep 5
 VM_TIER_IP="$(remote "$VM_IP" "ip -4 -br addr show ${TIER_NIC} | awk '{print \$3}' | cut -d/ -f1" "$VM_USER" || true)"
-[ -n "$VM_TIER_IP" ] || error "Tier NIC did not come up with an address. Check manually: ssh ${VM_USER}@$VM_IP"
+[ -n "$VM_TIER_IP" ] || error "Tier NIC did not come up with an address. VM is billable - check manually: ssh ${VM_USER}@$VM_IP, or tear down with: destroy-employee-desktop.sh --name $VM_NAME"
 # Belt and suspenders, same reasoning as deploy-private-storage.sh's tier NIC
 # check: even with the interface-name exclusions above, confirm the address
 # that actually came up is really on the tier, not some other interface that
@@ -654,7 +711,7 @@ TIER_MASK=$(( TIER_PREFIX == 0 ? 0 : (0xFFFFFFFF << (32 - TIER_PREFIX)) & 0xFFFF
 VM_TIER_IP_INT="$(ip_to_int "$VM_TIER_IP")"
 TIER_NET_INT="$(ip_to_int "$TIER_NET")"
 if [ $(( VM_TIER_IP_INT & TIER_MASK )) -ne $(( TIER_NET_INT & TIER_MASK )) ]; then
-  error "Interface '$TIER_NIC' came up with $VM_TIER_IP, which is not on the tier ($TIER_CIDR). Wrong interface selected. Check manually: ssh ${VM_USER}@$VM_IP 'ip -br addr show'"
+  error "Interface '$TIER_NIC' came up with $VM_TIER_IP, which is not on the tier ($TIER_CIDR). Wrong interface selected. VM is billable - check manually: ssh ${VM_USER}@$VM_IP 'ip -br addr show', or tear down with: destroy-employee-desktop.sh --name $VM_NAME"
 fi
 success "Tier NIC ($TIER_NIC) up at $VM_TIER_IP"
 
@@ -681,7 +738,7 @@ if [ "$VM_ALREADY_EXISTED" = "true" ]; then
   RDP_PASSWORD_SUMMARY="  RDP password : (unchanged -- set at first boot by the original deploy, not recoverable here)"
 else
   RDP_PASSWORD_SUMMARY="  RDP password : $DESKTOP_PASSWORD
-                  $([ "$PASSWORD_PROVIDED" = "true" ] && echo "(the password you passed with --password)" || echo "(generated by this script, shown once - save it now)")"
+                  $([ "$PASSWORD_PROVIDED" = "true" ] && echo "(the password you passed with --password)" || echo "(generated by this script - also printed right after creation above, in case a later step had failed)")"
 fi
 
 cat <<EOF
