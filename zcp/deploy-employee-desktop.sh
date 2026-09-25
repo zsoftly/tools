@@ -159,11 +159,19 @@ done
 # `[` exit 2, and since a failing left operand of `&&` is exempt from `set -e`, the `&&
 # error ...` on the far side of it never runs - the wait loop spins forever instead of
 # timing out, on a VM that's already been created and is billing. Confirmed live.
-if ! [[ "$SSH_WAIT_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
-  error "--ssh-wait '$SSH_WAIT_SECONDS' must be a positive whole number of seconds."
+#
+# Bounded to 7 digits (~115 days), not just "digits": an unbounded ^[1-9][0-9]*$ still lets
+# a value above the shell's 64-bit integer range through (e.g. 99999999999999999999), and
+# `[` rejects that with the same "integer expression expected" exit 2 - the same infinite
+# loop, just reached by a different input. Confirmed live.
+if ! [[ "$SSH_WAIT_SECONDS" =~ ^[1-9][0-9]{0,6}$ ]]; then
+  error "--ssh-wait '$SSH_WAIT_SECONDS' must be a whole number of seconds between 1 and 9999999."
 fi
-if ! [[ "$CLOUD_INIT_WAIT_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
-  error "--cloud-init-wait '$CLOUD_INIT_WAIT_SECONDS' must be a positive whole number of seconds."
+if ! [[ "$CLOUD_INIT_WAIT_SECONDS" =~ ^[1-9][0-9]{0,6}$ ]]; then
+  error "--cloud-init-wait '$CLOUD_INIT_WAIT_SECONDS' must be a whole number of seconds between 1 and 9999999."
+fi
+if [[ "$BILLING_CYCLE" != "hourly" && "$BILLING_CYCLE" != "monthly" ]]; then
+  error "--billing-cycle '$BILLING_CYCLE' must be 'hourly' or 'monthly'."
 fi
 
 # Emptiness checked before format, not after: an omitted --name/--username should read as
@@ -381,7 +389,14 @@ VM_TEMPLATE="$(resolve "$VM_TEMPLATE" "ubuntukde template" "zcp template list -o
 # version, e.g. "24.04 LTS"), it's embedded in `.name`/`.slug` only, e.g.
 # "zmi-ubuntukde--ubuntu2404-1.0.2". Refused below rather than silently deployed if older.
 UBUNTUKDE_MIN_VERSION="1.0.2"
-VM_TEMPLATE_NAME="$(zcp template list -o json | jq -r --arg s "$VM_TEMPLATE" '.[] | select(.slug==$s) | .name' | head -1)"
+VM_TEMPLATE_NAME="$(zcp template list -o json | jq -r --arg s "$VM_TEMPLATE" '.[] | select(.slug==$s) | .name' | head -1 || true)"
+# An explicitly-passed --vm-template skips the ubuntukde name filter above (resolve() returns
+# the flag value as-is), so a typo'd or unrelated slug would otherwise clear the version
+# check below if its name happened to end in x.y.z, deploy a VM, and only fail after the
+# full cloud-init wait (30 minutes by default) on a billing VM. Checked here instead.
+[ -n "$VM_TEMPLATE_NAME" ] || error "Template '$VM_TEMPLATE' not found. Check available templates: zcp template list | grep -i ubuntukde"
+echo "$VM_TEMPLATE_NAME" | grep -qi "ubuntukde" \
+  || error "Template '$VM_TEMPLATE' ('$VM_TEMPLATE_NAME') is not an ubuntukde template. This script only deploys the ubuntukde desktop image. Check: zcp template list | grep -i ubuntukde"
 VM_TEMPLATE_VERSION="$(echo "$VM_TEMPLATE_NAME" | jq -Rr 'capture("(?<v>[0-9]+\\.[0-9]+\\.[0-9]+)$").v // empty')"
 [ -n "$VM_TEMPLATE_VERSION" ] || error "Could not determine the ubuntukde template's app version from its name ('$VM_TEMPLATE_NAME'). Check manually: zcp template list"
 # This check runs on an explicitly-passed --vm-template too (VM_TEMPLATE is only
