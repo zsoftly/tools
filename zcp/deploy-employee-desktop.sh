@@ -256,7 +256,7 @@ fi
 RESERVED_USERNAMES=(ubuntu nobody root daemon bin sys sync games man lp mail news uucp proxy www-data backup list irc gnats syslog messagebus landscape xrdp sddm sshd polkitd dhcpcd uuidd tss pollinate tcpdump usbmux rtkit avahi geoclue dnsmasq)
 for reserved_username in "${RESERVED_USERNAMES[@]}"; do
   if [ "$DESKTOP_USERNAME" = "$reserved_username" ]; then
-    error "--username '$DESKTOP_USERNAME' collides with an existing account on this platform's Ubuntu image. Depending on the account, that either resets its password to the desktop password (e.g. 'ubuntu') or breaks first-boot provisioning outright and times out on an already-billing VM (e.g. 'xrdp', 'sddm', 'sshd', 'polkitd'). Choose a different username."
+    error "--username '$DESKTOP_USERNAME' collides with an existing account on this platform's Ubuntu image, so it's rejected here, before anything is created. Without this check, depending on the account, that collision would either reset its password to the desktop password (e.g. 'ubuntu') or break first-boot provisioning outright and time out on an already-billing VM (e.g. 'xrdp', 'sddm', 'sshd', 'polkitd'). Choose a different username."
   fi
 done
 
