@@ -95,8 +95,10 @@ Common overrides (auto-discovered or set to a default value if you leave them ou
                             file).
   --my-ip CIDR              Your public IP in CIDR form, used to scope admin-port
                             access (default: auto-detected via ifconfig.me, with /32
-                            appended). Any value works except 0.0.0.0/0, which would
-                            delete itself right after creation.
+                            appended). Any prefix except /0 works: a /0 covers the
+                            entire internet regardless of the address in front of it,
+                            and 0.0.0.0/0 specifically would also delete itself right
+                            after creation.
   --vm-template SLUG        ubuntukde marketplace template slug
                             (default: first match in 'zcp template list | grep ubuntukde')
   --ssh-wait SECONDS        How long to wait for SSH to come up (default: 180)
@@ -208,29 +210,36 @@ fi
 # pre-existing system/default account rather than land on a genuinely
 # cloud-init-created desktop user. Checked here, at parse time, before any zcp
 # call, for the same reason as USERNAME_RE above: discovering the collision
-# only after a full VM deploy wastes it. Confirmed against the ubuntukde
-# template's own first-boot script (ubuntukde-first-boot.sh): it runs
-# `useradd` only `if ! id "$DESKTOP_USER"`, but runs `chpasswd` on
-# $DESKTOP_USER unconditionally either way - so picking an already-existing
-# account doesn't just "silently skip creating a real desktop user", it
-# actively resets that pre-existing account's password to the desktop
-# password. 'ubuntu' is both this script's own SSH user AND the cloud image's
-# pre-existing default user (UID 1000, same as this platform's UID_MIN in
-# /etc/login.defs) - guaranteed to exist on every VM this script creates, so
-# picking it would silently reset the SSH admin account's password.
-# 'xrdp' and 'sddm' are confirmed present as system accounts on this
-# template too (the ansible role that builds it modifies an existing 'xrdp'
-# user/group directly, and installs the 'sddm' package, both of which create
-# their own system account on install) - picking either one collides the
-# same way, except their UID is below 1000 (Debian's system-account range),
-# so the runtime UID>=1000 poll in wait_for_cloud_init_user below never
-# succeeds and this instead burns the full --cloud-init-wait timeout (30
-# minutes by default) on an already-billing VM before failing. The rest of
-# this list is the standard Debian/Ubuntu base-system account names (what
-# 'getent passwd' shows on a stock image), including 'nobody' (UID 65534),
-# which would otherwise also slip past that same UID>=1000 poll - it's a
-# secondary layer only, not sufficient alone (see its own comment).
-RESERVED_USERNAMES=(ubuntu nobody root daemon bin sys sync games man lp mail news uucp proxy www-data backup list irc gnats syslog messagebus landscape xrdp sddm)
+# only after a full VM deploy wastes it. Two different failure modes here,
+# confirmed against the ubuntukde template's own first-boot script
+# (ubuntukde-first-boot.sh) and the real packages it installs, not assumed:
+#   - 'ubuntu' is both this script's own SSH user AND the cloud image's
+#     pre-existing default user, with a real /home/ubuntu (UID 1000, same as
+#     this platform's UID_MIN in /etc/login.defs) - guaranteed to exist on
+#     every VM this script creates. The first-boot script runs `useradd` only
+#     `if ! id "$DESKTOP_USER"`, but runs `chpasswd` on $DESKTOP_USER
+#     unconditionally either way, so picking 'ubuntu' silently resets the SSH
+#     admin account's own password to the desktop password.
+#   - 'xrdp', 'sddm', and 'sshd' are also confirmed pre-existing system
+#     accounts on this template (xrdp/sddm from their own packages, sshd from
+#     openssh-server in the base image), but they do NOT reach chpasswd at
+#     all: each package's postinst gives its account a home outside /home
+#     (xrdp: /run/xrdp, sddm: /var/lib/sddm, sshd: /run/sshd - confirmed by
+#     inspecting the actual .deb postinst scripts and 'getent passwd sshd' on
+#     a stock 24.04 image), so the first-boot script's `install -o
+#     "$DESKTOP_USER" ... "/home/${DESKTOP_USER}/.xsession"` fails outright
+#     (install doesn't create missing parent directories) and the whole
+#     script aborts there under `set -euo pipefail`, before chpasswd ever
+#     runs. Either way, their UID is below 1000 (Debian's system-account
+#     range), so the runtime UID>=1000 poll in wait_for_cloud_init_user below
+#     never succeeds, and the deploy instead burns the full --cloud-init-wait
+#     timeout (30 minutes by default) on an already-billing VM before
+#     failing. The rest of this list is the standard Debian/Ubuntu
+#     base-system account names (what 'getent passwd' shows on a stock
+#     image), including 'nobody' (UID 65534), which would otherwise also
+#     slip past that same UID>=1000 poll - it's a secondary layer only, not
+#     sufficient alone (see its own comment).
+RESERVED_USERNAMES=(ubuntu nobody root daemon bin sys sync games man lp mail news uucp proxy www-data backup list irc gnats syslog messagebus landscape xrdp sddm sshd)
 for reserved_username in "${RESERVED_USERNAMES[@]}"; do
   if [ "$DESKTOP_USERNAME" = "$reserved_username" ]; then
     error "--username '$DESKTOP_USERNAME' collides with a pre-existing system/default account on this platform's Ubuntu image (confirmed: it would never get a genuinely cloud-init-created login, and would falsely report success). Choose a different username."
