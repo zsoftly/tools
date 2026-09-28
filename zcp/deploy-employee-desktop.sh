@@ -208,18 +208,29 @@ fi
 # pre-existing system/default account rather than land on a genuinely
 # cloud-init-created desktop user. Checked here, at parse time, before any zcp
 # call, for the same reason as USERNAME_RE above: discovering the collision
-# only after a full VM deploy wastes it. Confirmed live: 'ubuntu' is this
-# script's own SSH user AND the cloud image's own pre-existing default user
-# (UID 1000, same as this platform's UID_MIN in /etc/login.defs) - it passes
-# USERNAME_RE and would otherwise produce a false "Cloud-init user confirmed"
-# with a password that was never actually set on that account, on every
-# single run, since 'ubuntu' is guaranteed to exist on every VM this script
-# creates. The rest of this list is the standard Debian/Ubuntu base-system
-# account names (what 'getent passwd' shows on a stock image), including
-# 'nobody' (UID 65534), which would otherwise also slip past the runtime
-# UID>=1000 poll in wait_for_cloud_init_user below - that check is a
+# only after a full VM deploy wastes it. Confirmed against the ubuntukde
+# template's own first-boot script (ubuntukde-first-boot.sh): it runs
+# `useradd` only `if ! id "$DESKTOP_USER"`, but runs `chpasswd` on
+# $DESKTOP_USER unconditionally either way - so picking an already-existing
+# account doesn't just "silently skip creating a real desktop user", it
+# actively resets that pre-existing account's password to the desktop
+# password. 'ubuntu' is both this script's own SSH user AND the cloud image's
+# pre-existing default user (UID 1000, same as this platform's UID_MIN in
+# /etc/login.defs) - guaranteed to exist on every VM this script creates, so
+# picking it would silently reset the SSH admin account's password.
+# 'xrdp' and 'sddm' are confirmed present as system accounts on this
+# template too (the ansible role that builds it modifies an existing 'xrdp'
+# user/group directly, and installs the 'sddm' package, both of which create
+# their own system account on install) - picking either one collides the
+# same way, except their UID is below 1000 (Debian's system-account range),
+# so the runtime UID>=1000 poll in wait_for_cloud_init_user below never
+# succeeds and this instead burns the full --cloud-init-wait timeout (30
+# minutes by default) on an already-billing VM before failing. The rest of
+# this list is the standard Debian/Ubuntu base-system account names (what
+# 'getent passwd' shows on a stock image), including 'nobody' (UID 65534),
+# which would otherwise also slip past that same UID>=1000 poll - it's a
 # secondary layer only, not sufficient alone (see its own comment).
-RESERVED_USERNAMES=(ubuntu nobody root daemon bin sys sync games man lp mail news uucp proxy www-data backup list irc gnats syslog messagebus landscape)
+RESERVED_USERNAMES=(ubuntu nobody root daemon bin sys sync games man lp mail news uucp proxy www-data backup list irc gnats syslog messagebus landscape xrdp sddm)
 for reserved_username in "${RESERVED_USERNAMES[@]}"; do
   if [ "$DESKTOP_USERNAME" = "$reserved_username" ]; then
     error "--username '$DESKTOP_USERNAME' collides with a pre-existing system/default account on this platform's Ubuntu image (confirmed: it would never get a genuinely cloud-init-created login, and would falsely report success). Choose a different username."
@@ -319,14 +330,17 @@ if [ -n "$MY_IP" ]; then
   if ! [[ "$MY_IP" =~ ^${OCTET_RE}\.${OCTET_RE}\.${OCTET_RE}\.${OCTET_RE}/${PREFIX_RE}$ ]]; then
     error "--my-ip '$MY_IP' must be a valid IPv4 CIDR, including the prefix (e.g. 203.0.113.5/32)."
   fi
-  # Only the literal 0.0.0.0/0 is actually unsafe here: lock_down_ssh's own open-rule
-  # cleanup matches that exact string (not "anything broader than /32"), so passing it
-  # would delete the very rule this script just created, right after the VM already
-  # exists. Traced lock_down_ssh's own jq filters directly to confirm this - anything
-  # else, including a /24 or a corporate NAT range, is untouched by that cleanup and
-  # works as scoped, same as the sibling scripts in this series already allow.
-  if [ "$MY_IP" = "0.0.0.0/0" ]; then
-    error "--my-ip '0.0.0.0/0' can't be used: it's identical to the rule this script's own SSH lockdown always removes, so it would delete itself right after being created. Use your actual public IP or a real range that doesn't include it."
+  # Two separate concerns here, not one:
+  # 1) A /0 prefix is the entire IPv4 address space no matter what octets precede it -
+  #    '203.0.113.5/0' is exactly as open as '0.0.0.0/0', not a scoped range. Rejected
+  #    outright below on the prefix alone.
+  # 2) The literal string '0.0.0.0/0' specifically would also delete itself: lock_down_ssh's
+  #    own open-rule cleanup matches that exact string (traced its jq filters directly to
+  #    confirm), so passing it would remove the very rule this script just created, right
+  #    after the VM already exists. A /24 or a corporate NAT range is untouched by that
+  #    cleanup and works as scoped, same as the sibling scripts in this series already allow.
+  if [ "${MY_IP##*/}" = "0" ]; then
+    error "--my-ip '$MY_IP' can't be used: a /0 prefix covers the entire IPv4 internet no matter what address precedes it, not a scoped range (and if it's literally 0.0.0.0/0, it would also delete itself right after being created, since it matches this script's own open-rule cleanup). Use your actual public IP or a real range that doesn't include it."
   fi
 fi
 if [ -z "$MY_IP" ]; then
@@ -514,6 +528,16 @@ wait_for_ssh() {
 # here is only a second, belt-and-suspenders layer on top of that - it does NOT by itself
 # catch every possible collision (it would not, for example, catch a colliding account an
 # operator manually created locally with a UID >= 1000), so it must not be relied on alone.
+#
+# UID alone is also not enough to mean "ready": read against the template's own
+# ubuntukde-first-boot.sh, `useradd` (which is what gives the user its UID) runs BEFORE
+# `chpasswd` sets the password and BEFORE xrdp is (re)started - both later in the same
+# script. A failure in between (that script runs under `set -euo pipefail`, so any of its
+# later commands failing aborts it right there) would leave the user present with no
+# password set and xrdp not started, while a UID-only check here would already report
+# success. Also polled for the script's own completion sentinel
+# (/var/lib/zmi/ubuntukde-first-boot.done, touched only as that script's last line, after
+# chpasswd and the xrdp restart) and that xrdp.service is actually active, not just present.
 wait_for_cloud_init_user() {
   # Deadline based on SECONDS, same reasoning as wait_for_ssh above: each remote() probe
   # here can itself take up to 3 retries x ~15s, so a fixed per-iteration counter can badly
@@ -521,13 +545,13 @@ wait_for_cloud_init_user() {
   local ip="$1" username="$2" timeout="$3" user="${4:-ubuntu}" start=$SECONDS uid
   info "Waiting for cloud-init to finish provisioning '$username' (first-boot KDE provisioning can take several minutes)..."
   while true; do
-    uid="$(remote "$ip" "id -u $username 2>/dev/null" "$user" || true)"
+    uid="$(remote "$ip" "if [ -f /var/lib/zmi/ubuntukde-first-boot.done ] && systemctl is-active --quiet xrdp; then id -u $username 2>/dev/null; fi" "$user" || true)"
     if [[ "$uid" =~ ^[0-9]+$ ]] && [ "$uid" -ge 1000 ]; then
-      success "Cloud-init user '$username' confirmed on '$VM_NAME' (uid $uid)"
+      success "Cloud-init user '$username' confirmed on '$VM_NAME' (uid $uid), first-boot complete, xrdp active"
       return 0
     fi
     if [ $((SECONDS - start)) -ge "$timeout" ]; then
-      error "Cloud-init user '$username' does not exist (or has no human uid >= 1000) on '$VM_NAME' after ${timeout}s. The template's first-boot provisioning may still be running (raise the timeout with --cloud-init-wait and re-run), may have failed, or '$username' may have collided with a pre-existing system account. Check manually: ssh ${user}@$ip 'sudo journalctl -u cloud-final' (or check for an 'invalid desktop username' style error, or 'id $username'). If the account exists and just needs a password reset: ssh ${user}@$ip 'sudo passwd $username'. To start over instead: $CLEANUP_HINT"
+      error "Cloud-init user '$username' does not exist (or first-boot hasn't finished: no human uid >= 1000, or the completion sentinel/xrdp aren't there yet) on '$VM_NAME' after ${timeout}s. The template's first-boot provisioning may still be running (raise the timeout with --cloud-init-wait and re-run), may have failed, or '$username' may have collided with a pre-existing system account. Check manually: ssh ${user}@$ip 'sudo journalctl -u ubuntukde-first-boot' (that's the unit that actually creates the user, sets the password, and starts xrdp - it runs after cloud-final, not as part of it) (or check for an 'invalid desktop username' style error, or 'id $username'). If the account exists and just needs a password reset: ssh ${user}@$ip 'sudo passwd $username'. To start over instead: $CLEANUP_HINT"
     fi
     sleep 10
   done
