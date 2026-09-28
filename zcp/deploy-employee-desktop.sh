@@ -220,32 +220,40 @@ fi
 #     `if ! id "$DESKTOP_USER"`, but runs `chpasswd` on $DESKTOP_USER
 #     unconditionally either way, so picking 'ubuntu' silently resets the SSH
 #     admin account's own password to the desktop password.
-#   - 'xrdp', 'sddm', 'sshd', and 'polkitd' are also confirmed pre-existing
-#     system accounts on this template (xrdp/sddm/polkitd from their own
-#     packages or KDE's dependency chain - accountsservice recommends
-#     polkitd, polkit-kde-agent-1 depends on it - sshd from openssh-server in
-#     the base image), but they do NOT reach chpasswd at all: each package's
-#     postinst gives its account a home outside /home (xrdp: /run/xrdp, sddm:
-#     /var/lib/sddm, sshd: /run/sshd, polkitd: / - confirmed by inspecting
-#     the actual .deb postinst scripts and 'getent passwd' for each on a
-#     stock 24.04 image), so the first-boot script's `install -o
-#     "$DESKTOP_USER" ... "/home/${DESKTOP_USER}/.xsession"` fails outright
-#     (install doesn't create missing parent directories) and the whole
-#     script aborts there under `set -euo pipefail`, before chpasswd ever
-#     runs. Either way, their UID is below 1000 (Debian's system-account
-#     range), so the runtime UID>=1000 poll in wait_for_cloud_init_user below
-#     never succeeds, and the deploy instead burns the full --cloud-init-wait
-#     timeout (30 minutes by default) on an already-billing VM before
-#     failing. This list isn't verified exhaustive against every account the
-#     image happens to carry (a KDE desktop pulls in a lot of packages, each
-#     potentially with its own service account) - only every collision found
-#     by review and confirmed against real package/template source so far.
-#     The rest of this list is the standard Debian/Ubuntu base-system account
-#     names (what 'getent passwd' shows on a stock image), including 'nobody'
-#     (UID 65534), which would otherwise also slip past that same UID>=1000
-#     poll - it's a secondary layer only, not sufficient alone (see its own
-#     comment).
-RESERVED_USERNAMES=(ubuntu nobody root daemon bin sys sync games man lp mail news uucp proxy www-data backup list irc gnats syslog messagebus landscape xrdp sddm sshd polkitd)
+#   - All the rest are also confirmed pre-existing system accounts on this
+#     template, but they do NOT reach chpasswd at all: none of them has a
+#     home directory under /home (confirmed live, see below), so the
+#     first-boot script's `install -o "$DESKTOP_USER" ...
+#     "/home/${DESKTOP_USER}/.xsession"` fails outright (install doesn't
+#     create missing parent directories) and the whole script aborts there
+#     under `set -euo pipefail`, before chpasswd ever runs. Either way, their
+#     UID is below 1000 (Debian's system-account range), so the runtime
+#     UID>=1000 poll in wait_for_cloud_init_user below never succeeds, and
+#     the deploy instead burns the full --cloud-init-wait timeout (30
+#     minutes by default) on an already-billing VM before failing.
+#
+#     This list is verified exhaustive, not just "every collision found so
+#     far": deployed a real ubuntukde VM and ran
+#     `getent passwd | awk -F: '$3>=1 && $3<1000'` against it directly (not
+#     inferred from package dependency chains). Every account it returned
+#     that also matches USERNAME_RE (^[a-z][a-z0-9_]*$ - lowercase, digits,
+#     underscore, starting with a letter) is listed below. Accounts with a
+#     hyphen in the name (www-data, systemd-resolve, systemd-timesync,
+#     systemd-network, fwupd-refresh) or a leading underscore (_apt) are
+#     already rejected by USERNAME_RE itself and don't need a separate
+#     denylist entry - included here anyway for the ones that also appear in
+#     the standard Debian/Ubuntu base-system account list, for defense in
+#     depth against a future image where the equivalent account might not
+#     have a hyphen. 'nobody' (UID 65534) is out of the UID<1000 range this
+#     probe covered, but was already independently confirmed and kept: it
+#     would otherwise slip past the same UID>=1000 poll for a different
+#     reason (see that poll's own comment).
+#
+#     This is a snapshot of the image at the time of the probe (VM created
+#     and destroyed under this same repo's zcp account, region yul-1,
+#     project default-9), not a live-updating guarantee - a future image
+#     rebuild could add new packages with their own new service accounts.
+RESERVED_USERNAMES=(ubuntu nobody root daemon bin sys sync games man lp mail news uucp proxy www-data backup list irc gnats syslog messagebus landscape xrdp sddm sshd polkitd dhcpcd uuidd tss pollinate tcpdump usbmux rtkit avahi geoclue dnsmasq)
 for reserved_username in "${RESERVED_USERNAMES[@]}"; do
   if [ "$DESKTOP_USERNAME" = "$reserved_username" ]; then
     error "--username '$DESKTOP_USERNAME' collides with an existing account on this platform's Ubuntu image. Depending on the account, that either resets its password to the desktop password (e.g. 'ubuntu') or breaks first-boot provisioning outright and times out on an already-billing VM (e.g. 'xrdp', 'sddm', 'sshd', 'polkitd'). Choose a different username."
