@@ -220,13 +220,15 @@ fi
 #     `if ! id "$DESKTOP_USER"`, but runs `chpasswd` on $DESKTOP_USER
 #     unconditionally either way, so picking 'ubuntu' silently resets the SSH
 #     admin account's own password to the desktop password.
-#   - 'xrdp', 'sddm', and 'sshd' are also confirmed pre-existing system
-#     accounts on this template (xrdp/sddm from their own packages, sshd from
-#     openssh-server in the base image), but they do NOT reach chpasswd at
-#     all: each package's postinst gives its account a home outside /home
-#     (xrdp: /run/xrdp, sddm: /var/lib/sddm, sshd: /run/sshd - confirmed by
-#     inspecting the actual .deb postinst scripts and 'getent passwd sshd' on
-#     a stock 24.04 image), so the first-boot script's `install -o
+#   - 'xrdp', 'sddm', 'sshd', and 'polkitd' are also confirmed pre-existing
+#     system accounts on this template (xrdp/sddm/polkitd from their own
+#     packages or KDE's dependency chain - accountsservice recommends
+#     polkitd, polkit-kde-agent-1 depends on it - sshd from openssh-server in
+#     the base image), but they do NOT reach chpasswd at all: each package's
+#     postinst gives its account a home outside /home (xrdp: /run/xrdp, sddm:
+#     /var/lib/sddm, sshd: /run/sshd, polkitd: / - confirmed by inspecting
+#     the actual .deb postinst scripts and 'getent passwd' for each on a
+#     stock 24.04 image), so the first-boot script's `install -o
 #     "$DESKTOP_USER" ... "/home/${DESKTOP_USER}/.xsession"` fails outright
 #     (install doesn't create missing parent directories) and the whole
 #     script aborts there under `set -euo pipefail`, before chpasswd ever
@@ -234,15 +236,19 @@ fi
 #     range), so the runtime UID>=1000 poll in wait_for_cloud_init_user below
 #     never succeeds, and the deploy instead burns the full --cloud-init-wait
 #     timeout (30 minutes by default) on an already-billing VM before
-#     failing. The rest of this list is the standard Debian/Ubuntu
-#     base-system account names (what 'getent passwd' shows on a stock
-#     image), including 'nobody' (UID 65534), which would otherwise also
-#     slip past that same UID>=1000 poll - it's a secondary layer only, not
-#     sufficient alone (see its own comment).
-RESERVED_USERNAMES=(ubuntu nobody root daemon bin sys sync games man lp mail news uucp proxy www-data backup list irc gnats syslog messagebus landscape xrdp sddm sshd)
+#     failing. This list isn't verified exhaustive against every account the
+#     image happens to carry (a KDE desktop pulls in a lot of packages, each
+#     potentially with its own service account) - only every collision found
+#     by review and confirmed against real package/template source so far.
+#     The rest of this list is the standard Debian/Ubuntu base-system account
+#     names (what 'getent passwd' shows on a stock image), including 'nobody'
+#     (UID 65534), which would otherwise also slip past that same UID>=1000
+#     poll - it's a secondary layer only, not sufficient alone (see its own
+#     comment).
+RESERVED_USERNAMES=(ubuntu nobody root daemon bin sys sync games man lp mail news uucp proxy www-data backup list irc gnats syslog messagebus landscape xrdp sddm sshd polkitd)
 for reserved_username in "${RESERVED_USERNAMES[@]}"; do
   if [ "$DESKTOP_USERNAME" = "$reserved_username" ]; then
-    error "--username '$DESKTOP_USERNAME' collides with a pre-existing system/default account on this platform's Ubuntu image (confirmed: it would never get a genuinely cloud-init-created login, and would falsely report success). Choose a different username."
+    error "--username '$DESKTOP_USERNAME' collides with an existing account on this platform's Ubuntu image. Depending on the account, that either resets its password to the desktop password (e.g. 'ubuntu') or breaks first-boot provisioning outright and times out on an already-billing VM (e.g. 'xrdp', 'sddm', 'sshd', 'polkitd'). Choose a different username."
   fi
 done
 
