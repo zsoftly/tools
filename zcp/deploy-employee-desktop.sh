@@ -1,13 +1,5 @@
 #!/bin/bash
-# ZCP Employee Desktop Deployer (Tutorial 3). Deploys a full Ubuntu KDE remote desktop
-# inside an EXISTING private tier (zcp/build-private-network.sh), with a named cloud-init
-# login. RDP is never exposed publicly, reached only over the tier.
-#
-# Usage:
-#   ./deploy-employee-desktop.sh --name jane-doe-desktop --tier-name my-workspace-tier \
-#     --username janedoe --ssh-key my-key [options]
-#
-# Requires: zcp CLI (authenticated), jq, ssh, curl
+# ZCP Employee Desktop Deployer (Tutorial 3): desktop VM in an existing private tier, RDP tier-only.
 set -e
 set -o pipefail
 
@@ -80,13 +72,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Single shared trap: bash traps replace rather than stack, so every file that needs
-# cleanup on exit sets a variable here rather than registering its own trap.
+# bash EXIT traps replace rather than stack; every file needing cleanup sets a var here instead.
 cleanup() { [ -n "${LIB_TMP:-}" ] && rm -rf "$LIB_TMP"; [ -n "${USERDATA_FILE:-}" ] && rm -f "$USERDATA_FILE"; }
 trap cleanup EXIT
 
-# Phase files: fetched from the same repo this script itself came from, unless
-# DEPLOY_LIB_DIR points at a local checkout (used for development/testing).
 LIB_BASE="${DEPLOY_LIB_DIR:-https://raw.githubusercontent.com/zsoftly/tools/main/zcp/lib/deploy-employee-desktop}"
 LIB_TMP="$(mktemp -d)"
 for f in 01-validate.sh 02-resolve.sh 03-create.sh 04-finish.sh; do
@@ -95,7 +84,6 @@ for f in 01-validate.sh 02-resolve.sh 03-create.sh 04-finish.sh; do
   else
     cp "$LIB_BASE/$f" "$LIB_TMP/$f" || error "Could not read $f from $LIB_BASE"
   fi
-  # shellcheck disable=SC1090
   source "$LIB_TMP/$f"
 done
 
