@@ -26,6 +26,7 @@ DESKTOP_USERNAME=""
 DESKTOP_PASSWORD=""
 PASSWORD_PROVIDED="false"
 VM_ALREADY_EXISTED="false"
+ADOPT_EXISTING="false"
 SSH_KEY=""
 MY_IP=""
 VM_TEMPLATE=""
@@ -113,6 +114,10 @@ Common overrides (auto-discovered or set to a default value if you leave them ou
   --network-plan SLUG       Network plan for the VM's public IP
   --storage-category SLUG   Storage category for the VM's root disk
   --billing-cycle CYCLE     hourly or monthly (default: hourly)
+  --adopt-existing          If a VM named --name already exists, proceed to modify it (attach
+                            the tier, lock down SSH, write netplan) instead of erroring. Off by
+                            default: without it, a --name collision with any pre-existing VM,
+                            related or not, stops here rather than silently taking it over.
   -y, --yes                 Skip the "resources about to be created" confirmation prompt
   -h, --help                 Show this help
 
@@ -153,6 +158,7 @@ while [[ $# -gt 0 ]]; do
     --billing-cycle) require_value "$1" "${2:-}"; BILLING_CYCLE="$2"; shift 2 ;;
     --ssh-wait) require_value "$1" "${2:-}"; SSH_WAIT_SECONDS="$2"; shift 2 ;;
     --cloud-init-wait) require_value "$1" "${2:-}"; CLOUD_INIT_WAIT_SECONDS="$2"; shift 2 ;;
+    --adopt-existing) ADOPT_EXISTING="true"; shift ;;
     -y|--yes) AUTO_YES="true"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) error "Unknown argument: $1 (see --help)" ;;
@@ -620,7 +626,11 @@ lock_down_ssh() {
 
   if ! zcp firewall list --ip "$ip_slug" -o json | jq -e --arg c "$MY_IP" \
       "$JQ_PORT_MATCH"' .[] | select((.protocol | proto_is("tcp")) and (.ports | port_has(22)) and .cidr==$c)' >/dev/null 2>&1; then
-    zcp firewall create --ip "$ip_slug" --protocol tcp --start-port 22 --end-port 22 --cidr "$MY_IP"
+    # A bare failing command here would abort under set -e without ever reaching this
+    # function's own error() calls below, so the operator would see a raw zcp error with no
+    # "VM is billable" cleanup hint. Handled explicitly instead.
+    zcp firewall create --ip "$ip_slug" --protocol tcp --start-port 22 --end-port 22 --cidr "$MY_IP" \
+      || error "Could not create the scoped SSH rule for $MY_IP on '$vm_label'. The template's default-open SSH rule may still be in place. Check manually: zcp firewall list --ip $ip_slug. VM is billable - clean up with: $CLEANUP_HINT"
   fi
   local confirmed="false" attempt
   for attempt in 1 2 3 4 5; do
@@ -640,7 +650,8 @@ lock_down_ssh() {
   if [ -n "$stale_ids" ]; then
     warn "Found SSH rule(s) on '$vm_label' scoped to a different IP than today's ($MY_IP), removing them. Your IP may have changed since the last run."
     while read -r rule_id; do
-      [ -n "$rule_id" ] && zcp firewall delete "$rule_id" --ip "$ip_slug" --yes
+      [ -n "$rule_id" ] && zcp firewall delete "$rule_id" --ip "$ip_slug" --yes \
+        || error "Could not delete stale SSH rule '$rule_id' on '$vm_label'. Check manually: zcp firewall list --ip $ip_slug. VM is billable - clean up with: $CLEANUP_HINT"
     done <<< "$stale_ids"
   fi
 
@@ -649,7 +660,8 @@ lock_down_ssh() {
     open_ids="$(zcp firewall list --ip "$ip_slug" -o json | jq -r "$JQ_PORT_MATCH"' .[] | select(((.protocol | proto_is("tcp")) or (.protocol | proto_is("udp"))) and (.ports | port_has(22)) and .cidr=="0.0.0.0/0") | .id' || true)"
     if [ -n "$open_ids" ]; then
       while read -r rule_id; do
-        [ -n "$rule_id" ] && zcp firewall delete "$rule_id" --ip "$ip_slug" --yes
+        [ -n "$rule_id" ] && zcp firewall delete "$rule_id" --ip "$ip_slug" --yes \
+          || error "Could not delete open SSH rule '$rule_id' on '$vm_label'. The template's default-open SSH rule may still be reachable from 0.0.0.0/0. Check manually: zcp firewall list --ip $ip_slug. VM is billable - clean up with: $CLEANUP_HINT"
       done <<< "$open_ids"
     fi
     still_open="$(zcp firewall list --ip "$ip_slug" -o json | jq "$JQ_PORT_MATCH"' [.[] | select(((.protocol | proto_is("tcp")) or (.protocol | proto_is("udp"))) and (.ports | port_has(22)) and .cidr=="0.0.0.0/0")] | length' || true)"
@@ -722,9 +734,19 @@ if ! instance_exists "$VM_NAME"; then
   success "'$VM_NAME' created"
 else
   VM_ALREADY_EXISTED="true"
-  warn "'$VM_NAME' already exists, skipping creation."
+  VM_SLUG="$(instance_slug_for_name "$VM_NAME")"
+  # A name match alone doesn't mean this is the tutorial's own VM: anyone's unrelated VM could
+  # happen to share --name. Without this gate, the rest of the script would silently attach the
+  # tier network to it, rewrite its SSH firewall rules, apply netplan changes to its OS, and the
+  # final summary's cleanup command would target it for deletion - all without the operator ever
+  # confirming it's the right VM. Fails closed by default; --adopt-existing opts in, after the
+  # slug below is shown so the operator can check it against 'zcp instance list' themselves.
+  if [ "$ADOPT_EXISTING" != "true" ]; then
+    error "A VM named '$VM_NAME' already exists (slug: $VM_SLUG). This script won't modify a pre-existing VM without confirmation - it can't tell whether this is the one from an earlier run of this same script or something unrelated. Check 'zcp instance list' / 'zcp instance get $VM_SLUG'. If this is the right VM, re-run with --adopt-existing to proceed. Otherwise, pick a different --name."
+  fi
+  warn "'$VM_NAME' already exists (slug: $VM_SLUG), adopting it per --adopt-existing instead of creating a new VM."
 fi
-VM_SLUG="$(instance_slug_for_name "$VM_NAME")"
+VM_SLUG="${VM_SLUG:-$(instance_slug_for_name "$VM_NAME")}"
 
 if ! ADDNET_OUTPUT="$(zcp instance add-network "$VM_SLUG" --network "$TIER_SLUG" 2>&1)"; then
   if echo "$ADDNET_OUTPUT" | grep -qi "already"; then
