@@ -24,7 +24,7 @@ Required:
 
 Options:
   --region REGION / --project PROJECT   zcp region/project (or \$ZCP_REGION/\$ZCP_PROJECT)
-  --password PASSWORD       Desktop login's password (default: generated, printed once)
+  --password PASSWORD       Desktop login's password (default: generated, printed twice: before create, and in the summary)
   --my-ip CIDR              Your public IP, scopes admin access (default: auto-detected /32)
   --vm-template SLUG        ubuntukde template slug (default: auto, must be >=1.0.2)
   --vm-plan SLUG             Compute plan (default: smallest >=4 vCPU/16GB)
@@ -76,7 +76,11 @@ done
 cleanup() { [ -n "${LIB_TMP:-}" ] && rm -rf "$LIB_TMP"; [ -n "${USERDATA_FILE:-}" ] && rm -f "$USERDATA_FILE"; }
 trap cleanup EXIT
 
-LIB_BASE="${DEPLOY_LIB_DIR:-https://raw.githubusercontent.com/zsoftly/tools/main/zcp/lib/deploy-employee-desktop}"
+# A local checkout must use its OWN helpers, not main's; curl-pipe-bash has no siblings to find.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+if [ -n "${DEPLOY_LIB_DIR:-}" ]; then LIB_BASE="$DEPLOY_LIB_DIR"
+elif [ -d "$SCRIPT_DIR/lib/deploy-employee-desktop" ]; then LIB_BASE="$SCRIPT_DIR/lib/deploy-employee-desktop"
+else LIB_BASE="https://raw.githubusercontent.com/zsoftly/tools/main/zcp/lib/deploy-employee-desktop"; fi
 LIB_TMP="$(mktemp -d)"
 for f in 01-validate.sh 02-resolve.sh 03-create.sh 04-finish.sh; do
   if [[ "$LIB_BASE" == http* ]]; then

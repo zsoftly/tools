@@ -1,6 +1,6 @@
 JQ_PORT_MATCH='def port_has($target): (. // "" | tostring) as $p | ($p == ($target|tostring)) or (($p | test("^[0-9]+-[0-9]+$")) and (($p / "-") as $r | ($r[0]|tonumber) <= $target and $target <= ($r[1]|tonumber))); def proto_is($target): (. // "" | ascii_downcase) == $target;'
 scoped_rule_exists() { zcp firewall list --ip "$1" -o json | jq -e --arg c "$MY_IP" "$JQ_PORT_MATCH"' .[] | select((.protocol|proto_is("tcp")) and (.ports|port_has(22)) and .cidr==$c)' >/dev/null 2>&1; }
-open_rule_ids() { zcp firewall list --ip "$1" -o json | jq -r "$JQ_PORT_MATCH"' .[] | select(((.protocol|proto_is("tcp")) or (.protocol|proto_is("udp"))) and (.ports|port_has(22)) and .cidr=="0.0.0.0/0") | .id' || true; }
+open_rule_ids() { zcp firewall list --ip "$1" -o json | jq -r "$JQ_PORT_MATCH"' .[] | select(((.protocol|proto_is("tcp")) or (.protocol|proto_is("udp"))) and (.ports|port_has(22)) and .cidr=="0.0.0.0/0") | .id'; }
 delete_rule() { zcp firewall delete "$1" --ip "$2" --yes || error "Could not delete rule '$1'. VM is billable - clean up with: $CLEANUP_HINT"; }
 
 lock_down_ssh() {
@@ -20,12 +20,13 @@ lock_down_ssh() {
 
   confirmed="false"
   for attempt in 1 2 3; do
-    ids="$(open_rule_ids "$ip_slug")"
-    [ -n "$ids" ] && while read -r id; do [ -n "$id" ] && delete_rule "$id" "$ip_slug"; done <<< "$ids"
-    [ -z "$(open_rule_ids "$ip_slug")" ] && { confirmed="true"; break; }
+    if ids="$(open_rule_ids "$ip_slug")"; then
+      [ -n "$ids" ] && while read -r id; do [ -n "$id" ] && delete_rule "$id" "$ip_slug"; done <<< "$ids"
+      [ -z "$ids" ] && { confirmed="true"; break; }
+    fi
     sleep 3
   done
-  [ "$confirmed" = "true" ] || error "Lockdown failed: 0.0.0.0/0 still exposes port 22 for '$label'. VM is billable - clean up with: $CLEANUP_HINT"
+  [ "$confirmed" = "true" ] || error "Lockdown failed: 0.0.0.0/0 still exposes port 22 for '$label' (or the query to check kept failing). VM is billable - clean up with: $CLEANUP_HINT"
 
   confirmed="false"
   for attempt in 1 2 3; do scoped_rule_exists "$ip_slug" && { confirmed="true"; break; }; sleep 3; done
@@ -73,7 +74,7 @@ wait_for_cloud_init_user() {
     [[ "$uid" =~ ^[0-9]+$ ]] && [ "$uid" -ge 1000 ] \
       && { success "Cloud-init user '$DESKTOP_USERNAME' confirmed (uid $uid), first-boot complete, xrdp active"; return 0; }
     [ $((SECONDS - start)) -ge "$CLOUD_INIT_WAIT_SECONDS" ] \
-      && error "Cloud-init user '$DESKTOP_USERNAME' not ready after ${CLOUD_INIT_WAIT_SECONDS}s. Check: ssh ${VM_USER}@$VM_IP 'sudo journalctl -u ubuntukde-first-boot'. To start over: $CLEANUP_HINT"
+      && error "Cloud-init user '$DESKTOP_USERNAME' not ready after ${CLOUD_INIT_WAIT_SECONDS}s. Check: ssh ${VM_USER}@$VM_IP 'sudo journalctl -u ubuntukde-first-boot'. If the account exists and just needs a password reset: ssh ${VM_USER}@$VM_IP 'sudo passwd $DESKTOP_USERNAME'. To start over: $CLEANUP_HINT"
     sleep 10
   done
 }
