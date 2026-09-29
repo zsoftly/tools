@@ -106,6 +106,11 @@ wait_for_gone() {
   done
 }
 
+# A valid-JSON-but-wrong-shape response (e.g. {}) must not silently read as "empty list": .[]
+# on an object yields no output too, same as a genuinely empty array - confirmed live, this
+# would otherwise let a malformed response falsely report the VM/leftover network as absent.
+require_list_json() { jq -e '(type=="array") or (type=="null")' <<< "$1" >/dev/null 2>&1; }
+
 capture_vm_network_id() {
   local vm_name="$1"
   # '(. // [])[]' guard: same reasoning as the VM_MATCHES fix below for 'zcp instance list'
@@ -122,6 +127,7 @@ step "Checking the desktop VM"
 VM_PRESENT="false"
 VM_SLUG=""
 VM_LIST_JSON="$(zcp instance list -o json)" || error "Could not list instances to check whether '$VM_NAME' exists."
+require_list_json "$VM_LIST_JSON" || error "zcp instance list returned an unexpected response, can't tell whether '$VM_NAME' exists. Check manually: zcp instance list"
 # Confirmed live: 'zcp instance list -o json' returns the literal 'null', not '[]', on a
 # fully clean account. '.[] // []' tolerates that instead of crashing under set -e/pipefail
 # before ever reaching the friendly "Nothing matched --name" path at the bottom.
@@ -183,18 +189,23 @@ if [ "$VM_PRESENT" = "false" ]; then
 elif [ -z "$VM_NETWORK_ID" ]; then
   UNVERIFIED="${UNVERIFIED}${VM_NAME} (no network reference captured)"$'\n'
 else
-  found=""
+  found="" ip_list_ok="false"
   for lo_attempt in 1 2 3 4 5; do
     # '(. // [])[]' guard: confirmed live, 'zcp ip list -o json' returns the literal 'null'
     # (not '[]') once the last IP-holding resource in the project is gone - exactly the
-    # normal, successful teardown path this loop runs on. The unguarded '.[]' here crashed
-    # with 'jq: error: Cannot iterate over null (null)' (exit 5) and, under set -e/pipefail,
-    # killed the script before it ever reached the Done summary or the exit-2 contract below.
-    found="$(zcp ip list -o json | jq -r --arg id "$VM_NETWORK_ID" '(. // [])[] | select(.network_id==$id) | .slug' | head -1)"
+    # normal, successful teardown path this loop runs on. require_list_json rejects any
+    # other shape (e.g. '{}') instead of letting it silently read as "no leftover" too.
+    ip_list_json="$(zcp ip list -o json)" && require_list_json "$ip_list_json" || { sleep 4; continue; }
+    ip_list_ok="true"
+    found="$(echo "$ip_list_json" | jq -r --arg id "$VM_NETWORK_ID" '(. // [])[] | select(.network_id==$id) | .slug' | head -1)"
     [ -z "$found" ] && break
     sleep 4
   done
-  [ -n "$found" ] && LEFTOVER="${LEFTOVER}${found} (network id: ${VM_NETWORK_ID})"$'\n'
+  if [ "$ip_list_ok" = "false" ]; then
+    UNVERIFIED="${UNVERIFIED}${VM_NAME} (could not get a valid ip-list response to check)"$'\n'
+  elif [ -n "$found" ]; then
+    LEFTOVER="${LEFTOVER}${found} (network id: ${VM_NETWORK_ID})"$'\n'
+  fi
 fi
 
 if [ -n "$LEFTOVER" ]; then

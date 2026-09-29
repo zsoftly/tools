@@ -1,6 +1,9 @@
 JQ_PORT_MATCH='def port_has($target): (. // "" | tostring) as $p | ($p == ($target|tostring)) or (($p | test("^[0-9]+-[0-9]+$")) and (($p / "-") as $r | ($r[0]|tonumber) <= $target and $target <= ($r[1]|tonumber))); def proto_is($target): (. // "" | ascii_downcase) == $target;'
 scoped_rule_exists() { zcp firewall list --ip "$1" -o json | jq -e --arg c "$MY_IP" "$JQ_PORT_MATCH"' .[] | select((.protocol|proto_is("tcp")) and (.ports|port_has(22)) and .cidr==$c)' >/dev/null 2>&1; }
-open_rule_ids() { zcp firewall list --ip "$1" -o json | jq -r "$JQ_PORT_MATCH"' .[] | select(((.protocol|proto_is("tcp")) or (.protocol|proto_is("udp"))) and (.ports|port_has(22)) and .cidr=="0.0.0.0/0") | .id'; }
+open_rule_ids() {
+  local j; j="$(zcp firewall list --ip "$1" -o json)" && require_list_json "$j" || return 1
+  jq -r "$JQ_PORT_MATCH"' .[] | select(((.protocol|proto_is("tcp")) or (.protocol|proto_is("udp"))) and (.ports|port_has(22)) and .cidr=="0.0.0.0/0") | .id' <<< "$j"
+}
 delete_rule() { zcp firewall delete "$1" --ip "$2" --yes || error "Could not delete rule '$1'. VM is billable - clean up with: $CLEANUP_HINT"; }
 lock_down_ssh() {
   local ip_slug="$1" label="$2" confirmed attempt id ids

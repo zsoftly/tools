@@ -1,6 +1,10 @@
+# A valid-JSON-but-wrong-shape response (e.g. {}) must not silently read as "empty list": .[]
+# on an object yields no output too, same as a genuinely empty array - shared by every site
+# below that trusts a zcp *list -o json response.
+require_list_json() { jq -e '(type=="array") or (type=="null")' <<< "$1" >/dev/null 2>&1; }
 instance_exists() {
   local j; j="$(zcp instance list -o json)" || error "Could not list instances."
-  jq empty <<< "$j" 2>/dev/null || error "zcp instance list returned invalid JSON, can't tell if '$1' exists. Check manually: zcp instance list."
+  require_list_json "$j" || error "zcp instance list returned an unexpected response, can't tell if '$1' exists. Check manually: zcp instance list."
   jq -e --arg n "$1" '(. // [])[] | select(.name==$n)' <<< "$j" >/dev/null 2>&1
 }
 slug_for_name() {
