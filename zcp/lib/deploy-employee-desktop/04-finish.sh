@@ -6,14 +6,15 @@ open_rule_ids() {
 }
 delete_rule() { zcp firewall delete "$1" --ip "$2" --yes || error "Could not delete rule '$1'. VM is billable - clean up with: $CLEANUP_HINT"; }
 lock_down_ssh() {
-  local ip_slug="$1" label="$2" confirmed attempt id ids
+  local ip_slug="$1" label="$2" confirmed attempt id ids j
   scoped_rule_exists "$ip_slug" \
     || zcp firewall create --ip "$ip_slug" --protocol tcp --start-port 22 --end-port 22 --cidr "$MY_IP" \
     || error "Could not create the scoped SSH rule for $MY_IP on '$label'. VM is billable - clean up with: $CLEANUP_HINT"
   for attempt in 1 2 3; do scoped_rule_exists "$ip_slug" && { confirmed="true"; break; }; sleep 3; done
   [ "$confirmed" = "true" ] || error "Could not confirm the scoped SSH rule on '$label'. VM is billable - clean up with: $CLEANUP_HINT"
-  ids="$(zcp firewall list --ip "$ip_slug" -o json | jq -r --arg c "$MY_IP" \
-    "$JQ_PORT_MATCH"' .[] | select((.protocol|proto_is("tcp")) and (.ports|port_has(22)) and .cidr!="0.0.0.0/0" and .cidr!=$c) | .id')"
+  j="$(zcp firewall list --ip "$ip_slug" -o json)" && require_list_json "$j" \
+    || error "zcp firewall list returned an unexpected response for '$label', can't check for stale SSH rules. Check manually: zcp firewall list --ip $ip_slug. VM is billable - clean up with: $CLEANUP_HINT"
+  ids="$(jq -r --arg c "$MY_IP" "$JQ_PORT_MATCH"' .[] | select((.protocol|proto_is("tcp")) and (.ports|port_has(22)) and .cidr!="0.0.0.0/0" and .cidr!=$c) | .id' <<< "$j")"
   if [ -n "$ids" ]; then
     warn "Removing SSH rule(s) on '$label' scoped to a different IP than today's."
     while read -r id; do [ -n "$id" ] && delete_rule "$id" "$ip_slug"; done <<< "$ids"
