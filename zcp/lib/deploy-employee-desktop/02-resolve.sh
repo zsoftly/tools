@@ -77,7 +77,8 @@ resolve_resources() {
   info "Resolved: tier=$TIER_NAME($TIER_CIDR) template=$VM_TEMPLATE($VM_TEMPLATE_VERSION) plan=$VM_PLAN($VM_PLAN_CPU vCPU/$VM_PLAN_MEMORY) network=$NETWORK_PLAN storage=$STORAGE_CATEGORY user=$DESKTOP_USERNAME"
 
   if [ "$AUTO_YES" != "true" ]; then
-    echo "This creates a VM now; billing starts immediately." >&2
+    if instance_exists "$VM_NAME"; then echo "'$VM_NAME' already exists; this attaches/reconfigures it, no new VM." >&2
+    else echo "This creates a VM now; billing starts immediately." >&2; fi
     read -r -p "Type 'yes' to continue: " CONFIRM
     [ "$CONFIRM" = "yes" ] || error "Cancelled."
   fi
