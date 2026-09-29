@@ -4,21 +4,39 @@ open_rule_ids() {
   local j; j="$(zcp firewall list --ip "$1" -o json)" && require_list_json "$j" || return 1
   jq -r "$JQ_PORT_MATCH"' .[] | select(((.protocol|proto_is("tcp")) or (.protocol|proto_is("udp"))) and (.ports|port_has(22)) and .cidr=="0.0.0.0/0") | .id' <<< "$j"
 }
+stale_rule_ids() {
+  # A confirmed scoped rule makes a null response ambiguous. Require the API's
+  # firewall-rule array before treating the absence of stale rules as safe.
+  local j; j="$(zcp firewall list --ip "$1" -o json)" && jq -e 'type=="array"' <<< "$j" >/dev/null 2>&1 || return 1
+  jq -r --arg c "$MY_IP" "$JQ_PORT_MATCH"'
+    [.[] | select((.protocol|proto_is("tcp")) and (.ports|port_has(22)))] as $ssh_rules
+    | if all($ssh_rules[]; (.id|type=="string" and length>0) and (.cidr|type=="string" and length>0)) then
+        $ssh_rules[] | select(.cidr!="0.0.0.0/0" and .cidr!=$c) | .id
+      else
+        error("malformed TCP/22 firewall rule")
+      end' <<< "$j"
+}
 delete_rule() { zcp firewall delete "$1" --ip "$2" --yes || error "Could not delete rule '$1'. VM is billable - clean up with: $CLEANUP_HINT"; }
 lock_down_ssh() {
-  local ip_slug="$1" label="$2" confirmed attempt id ids j
+  local ip_slug="$1" label="$2" confirmed attempt id ids
   scoped_rule_exists "$ip_slug" \
     || zcp firewall create --ip "$ip_slug" --protocol tcp --start-port 22 --end-port 22 --cidr "$MY_IP" \
     || error "Could not create the scoped SSH rule for $MY_IP on '$label'. VM is billable - clean up with: $CLEANUP_HINT"
   for attempt in 1 2 3; do scoped_rule_exists "$ip_slug" && { confirmed="true"; break; }; sleep 3; done
   [ "$confirmed" = "true" ] || error "Could not confirm the scoped SSH rule on '$label'. VM is billable - clean up with: $CLEANUP_HINT"
-  j="$(zcp firewall list --ip "$ip_slug" -o json)" && require_list_json "$j" \
-    || error "zcp firewall list returned an unexpected response for '$label', can't check for stale SSH rules. Check manually: zcp firewall list --ip $ip_slug. VM is billable - clean up with: $CLEANUP_HINT"
-  ids="$(jq -r --arg c "$MY_IP" "$JQ_PORT_MATCH"' .[] | select((.protocol|proto_is("tcp")) and (.ports|port_has(22)) and .cidr!="0.0.0.0/0" and .cidr!=$c) | .id' <<< "$j")"
-  if [ -n "$ids" ]; then
-    warn "Removing SSH rule(s) on '$label' scoped to a different IP than today's."
-    while read -r id; do [ -n "$id" ] && delete_rule "$id" "$ip_slug"; done <<< "$ids"
-  fi
+  confirmed="false"
+  for attempt in 1 2 3; do
+    if ids="$(stale_rule_ids "$ip_slug")"; then
+      if [ -n "$ids" ]; then
+        warn "Removing SSH rule(s) on '$label' scoped to a different IP than today's."
+        while read -r id; do [ -n "$id" ] && delete_rule "$id" "$ip_slug"; done <<< "$ids"
+      else
+        confirmed="true"; break
+      fi
+    fi
+    sleep 3
+  done
+  [ "$confirmed" = "true" ] || error "Lockdown failed: SSH rule(s) scoped to old operator IPs still exist for '$label' (or the query to check kept failing). VM is billable - clean up with: $CLEANUP_HINT"
   confirmed="false"
   for attempt in 1 2 3; do
     if ids="$(open_rule_ids "$ip_slug")"; then
