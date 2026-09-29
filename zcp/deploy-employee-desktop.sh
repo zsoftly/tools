@@ -1,0 +1,73 @@
+#!/bin/bash
+# ZCP Employee Desktop Deployer (Tutorial 3): desktop VM in an existing private tier, RDP tier-only.
+set -e
+set -o pipefail
+RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; YELLOW='\033[0;33m'; NC='\033[0m'
+info() { echo -e "${CYAN}[INFO]${NC} $1" >&2; }
+success() { echo -e "${GREEN}[OK]${NC} $1" >&2; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $1" >&2; }
+error() { echo -e "${RED}[ERROR]${NC} $1" >&2; exit 1; }
+step() { echo "" >&2; echo -e "${CYAN}==>${NC} $1" >&2; }
+usage() {
+  cat <<EOF
+Usage: $0 --name <vm-name> --tier-name <tier-name> --username <login> --ssh-key <name> [options]
+Required: --name --tier-name --username --ssh-key
+Options: --region --project --password --my-ip --vm-template --vm-plan --network-plan
+  --storage-category --billing-cycle --ssh-wait --cloud-init-wait --adopt-existing -y/--yes
+See the "Deploy Ubuntu Employee Desktops" tutorial for what each flag does and its default.
+EOF
+}
+require_value() { [[ -z "${2:-}" || "$2" == -* ]] && error "$1 requires a value."; :; }
+VM_NAME="" TIER_NAME="" DESKTOP_USERNAME="" DESKTOP_PASSWORD="" PASSWORD_PROVIDED="false"
+VM_ALREADY_EXISTED="false" ADOPT_EXISTING="false" SSH_KEY="" MY_IP="" VM_TEMPLATE=""
+VM_PLAN="" NETWORK_PLAN="" STORAGE_CATEGORY="" BILLING_CYCLE="hourly" AUTO_YES="false"
+SSH_WAIT_SECONDS=180 CLOUD_INIT_WAIT_SECONDS=1800 TIER_NIC_WAIT_SECONDS=300
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --region) require_value "$1" "${2:-}"; ZCP_REGION="$2"; shift 2 ;;
+    --project) require_value "$1" "${2:-}"; ZCP_PROJECT="$2"; shift 2 ;;
+    --name) require_value "$1" "${2:-}"; VM_NAME="$2"; shift 2 ;;
+    --tier-name) require_value "$1" "${2:-}"; TIER_NAME="$2"; shift 2 ;;
+    --username) require_value "$1" "${2:-}"; DESKTOP_USERNAME="$2"; shift 2 ;;
+    --password) require_value "$1" "${2:-}"; DESKTOP_PASSWORD="$2"; PASSWORD_PROVIDED="true"; shift 2 ;;
+    --ssh-key) require_value "$1" "${2:-}"; SSH_KEY="$2"; shift 2 ;;
+    --my-ip) require_value "$1" "${2:-}"; MY_IP="$2"; shift 2 ;;
+    --vm-template) require_value "$1" "${2:-}"; VM_TEMPLATE="$2"; shift 2 ;;
+    --vm-plan) require_value "$1" "${2:-}"; VM_PLAN="$2"; shift 2 ;;
+    --network-plan) require_value "$1" "${2:-}"; NETWORK_PLAN="$2"; shift 2 ;;
+    --storage-category) require_value "$1" "${2:-}"; STORAGE_CATEGORY="$2"; shift 2 ;;
+    --billing-cycle) require_value "$1" "${2:-}"; BILLING_CYCLE="$2"; shift 2 ;;
+    --ssh-wait) require_value "$1" "${2:-}"; SSH_WAIT_SECONDS="$2"; shift 2 ;;
+    --cloud-init-wait) require_value "$1" "${2:-}"; CLOUD_INIT_WAIT_SECONDS="$2"; shift 2 ;;
+    --adopt-existing) ADOPT_EXISTING="true"; shift ;;
+    -y|--yes) AUTO_YES="true"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) error "Unknown argument: $1 (see --help)" ;;
+  esac
+done
+# bash EXIT traps replace rather than stack; every file needing cleanup sets a var here instead.
+cleanup() { [ -n "${LIB_TMP:-}" ] && rm -rf "$LIB_TMP"; [ -n "${USERDATA_FILE:-}" ] && rm -f "$USERDATA_FILE"; }
+trap cleanup EXIT
+# A local checkout must use its OWN helpers, not main's; curl-pipe-bash has no siblings to find.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+if [ -n "${DEPLOY_LIB_DIR:-}" ]; then LIB_BASE="$DEPLOY_LIB_DIR"
+elif [ -d "$SCRIPT_DIR/lib/deploy-employee-desktop" ]; then LIB_BASE="$SCRIPT_DIR/lib/deploy-employee-desktop"
+else LIB_BASE="https://raw.githubusercontent.com/zsoftly/tools/main/zcp/lib/deploy-employee-desktop"; fi
+LIB_TMP="$(mktemp -d)"
+for f in 01-validate.sh 02-resolve.sh 03-create.sh 04-finish.sh; do
+  if [[ "$LIB_BASE" == http* ]]; then
+    curl -fsSL "$LIB_BASE/$f" -o "$LIB_TMP/$f" || error "Could not fetch $f from $LIB_BASE"
+  else
+    cp "$LIB_BASE/$f" "$LIB_TMP/$f" || error "Could not read $f from $LIB_BASE"
+  fi
+  source "$LIB_TMP/$f"
+done
+validate_inputs
+resolve_resources
+create_or_adopt_vm
+info "Locking down SSH to your own IP..."
+lock_down_ssh "$IP_SLUG" "$VM_NAME"
+wait_for_ssh "$VM_IP" "$SSH_WAIT_SECONDS" "$VM_USER"
+setup_tier_nic
+wait_for_cloud_init_user
+print_summary
