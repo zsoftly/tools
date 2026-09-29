@@ -71,7 +71,10 @@ resolve_resources() {
   info "Resolved: tier=$TIER_NAME($TIER_CIDR) template=$VM_TEMPLATE($VM_TEMPLATE_VERSION) plan=$VM_PLAN($VM_PLAN_CPU vCPU/$VM_PLAN_MEMORY) network=$NETWORK_PLAN storage=$STORAGE_CATEGORY user=$DESKTOP_USERNAME"
   if [ "$AUTO_YES" != "true" ]; then
     if instance_exists "$VM_NAME"; then
-      [ "$ADOPT_EXISTING" = "true" ] || error "A VM named '$VM_NAME' already exists. Not modifying it without confirmation. Check 'zcp instance list'; re-run with --adopt-existing if it's the right one."
+      if [ "$ADOPT_EXISTING" != "true" ]; then
+        local existing_slug; existing_slug="$(instance_slug_for_name "$VM_NAME")"
+        error "A VM named '$VM_NAME' already exists (slug: $existing_slug). Not modifying it without confirmation. Check 'zcp instance get $existing_slug'; re-run with --adopt-existing if it's the right one."
+      fi
       echo "'$VM_NAME' already exists; this attaches/reconfigures it, no new VM." >&2
     else
       echo "This creates a VM now; billing starts immediately." >&2
