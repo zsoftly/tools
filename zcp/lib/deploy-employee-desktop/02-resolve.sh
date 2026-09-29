@@ -5,7 +5,7 @@ resolve() {
   [ -n "$out" ] && [ "$out" != "null" ] || error "Could not auto-discover $label. Pass it explicitly."
   echo "$out"
 }
-version_ge() { [ "$1" = "$2" ] && return 0; [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$1" ]; }
+version_ge() { local IFS=. a b i; read -ra a <<< "$1"; read -ra b <<< "$2"; for i in 0 1 2; do [ "${a[i]:-0}" -gt "${b[i]:-0}" ] && return 0; [ "${a[i]:-0}" -lt "${b[i]:-0}" ] && return 1; done; return 0; }
 resolve_resources() {
   step "Preflight checks"
   command -v zcp >/dev/null 2>&1 || error "zcp CLI not found."
@@ -70,8 +70,12 @@ resolve_resources() {
   STORAGE_CATEGORY="$(resolve "$STORAGE_CATEGORY" "storage category" "zcp storage-category list -o json" '.[0].slug')"
   info "Resolved: tier=$TIER_NAME($TIER_CIDR) template=$VM_TEMPLATE($VM_TEMPLATE_VERSION) plan=$VM_PLAN($VM_PLAN_CPU vCPU/$VM_PLAN_MEMORY) network=$NETWORK_PLAN storage=$STORAGE_CATEGORY user=$DESKTOP_USERNAME"
   if [ "$AUTO_YES" != "true" ]; then
-    if instance_exists "$VM_NAME"; then echo "'$VM_NAME' already exists; this attaches/reconfigures it, no new VM." >&2
-    else echo "This creates a VM now; billing starts immediately." >&2; fi
+    if instance_exists "$VM_NAME"; then
+      [ "$ADOPT_EXISTING" = "true" ] || error "A VM named '$VM_NAME' already exists. Not modifying it without confirmation. Check 'zcp instance list'; re-run with --adopt-existing if it's the right one."
+      echo "'$VM_NAME' already exists; this attaches/reconfigures it, no new VM." >&2
+    else
+      echo "This creates a VM now; billing starts immediately." >&2
+    fi
     read -r -p "Type 'yes' to continue: " CONFIRM
     [ "$CONFIRM" = "yes" ] || error "Cancelled."
   fi

@@ -1,6 +1,7 @@
 instance_exists() {
   local j; j="$(zcp instance list -o json)" || error "Could not list instances."
-  echo "$j" | jq -e --arg n "$1" '(. // [])[] | select(.name==$n)' >/dev/null 2>&1
+  jq empty <<< "$j" 2>/dev/null || error "zcp instance list returned invalid JSON, can't tell if '$1' exists. Check manually: zcp instance list."
+  jq -e --arg n "$1" '(. // [])[] | select(.name==$n)' <<< "$j" >/dev/null 2>&1
 }
 slug_for_name() {
   local label="$1" cmd="$2" name="$3" j m c
