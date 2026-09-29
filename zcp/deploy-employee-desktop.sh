@@ -2,52 +2,26 @@
 # ZCP Employee Desktop Deployer (Tutorial 3): desktop VM in an existing private tier, RDP tier-only.
 set -e
 set -o pipefail
-
 RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; YELLOW='\033[0;33m'; NC='\033[0m'
 info() { echo -e "${CYAN}[INFO]${NC} $1" >&2; }
 success() { echo -e "${GREEN}[OK]${NC} $1" >&2; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1" >&2; }
 error() { echo -e "${RED}[ERROR]${NC} $1" >&2; exit 1; }
 step() { echo "" >&2; echo -e "${CYAN}==>${NC} $1" >&2; }
-
 usage() {
   cat <<EOF
-ZCP Employee Desktop Deployer
-
 Usage: $0 --name <vm-name> --tier-name <tier-name> --username <login> --ssh-key <name> [options]
-
-Required:
-  --name NAME       Exact name for the desktop VM.
-  --tier-name NAME  Existing private tier from build-private-network.sh. Not auto-discovered.
-  --username NAME   Desktop login (cloud-init). Must match ^[a-z][a-z0-9_]*\$, max 32 chars.
-  --ssh-key NAME    Name of an existing 'zcp ssh-key' entry.
-
-Options:
-  --region REGION / --project PROJECT   zcp region/project (or \$ZCP_REGION/\$ZCP_PROJECT)
-  --password PASSWORD       Desktop login's password (default: generated, printed twice: before create, and in the summary)
-  --my-ip CIDR              Your public IP, scopes admin access (default: auto-detected /32)
-  --vm-template SLUG        ubuntukde template slug (default: auto, must be >=1.0.2)
-  --vm-plan SLUG             Compute plan (default: smallest >=4 vCPU/16GB)
-  --network-plan SLUG        Network plan for the public IP (default: auto)
-  --storage-category SLUG    Root disk storage category (default: auto)
-  --billing-cycle CYCLE      hourly or monthly (default: hourly)
-  --ssh-wait SECONDS          Wait for SSH (default: 180)
-  --cloud-init-wait SECONDS   Wait for desktop provisioning (default: 1800)
-  --adopt-existing            Modify a pre-existing --name match instead of erroring
-  -y, --yes                   Skip the confirmation prompt
-  -h, --help                  Show this help
-
-See the "Deploy Ubuntu Employee Desktops" tutorial for full details on each option.
+Required: --name --tier-name --username --ssh-key
+Options: --region --project --password --my-ip --vm-template --vm-plan --network-plan
+  --storage-category --billing-cycle --ssh-wait --cloud-init-wait --adopt-existing -y/--yes
+See the "Deploy Ubuntu Employee Desktops" tutorial for what each flag does and its default.
 EOF
 }
-
 require_value() { [[ -z "${2:-}" || "$2" == -* ]] && error "$1 requires a value."; :; }
-
 VM_NAME="" TIER_NAME="" DESKTOP_USERNAME="" DESKTOP_PASSWORD="" PASSWORD_PROVIDED="false"
 VM_ALREADY_EXISTED="false" ADOPT_EXISTING="false" SSH_KEY="" MY_IP="" VM_TEMPLATE=""
 VM_PLAN="" NETWORK_PLAN="" STORAGE_CATEGORY="" BILLING_CYCLE="hourly" AUTO_YES="false"
 SSH_WAIT_SECONDS=180 CLOUD_INIT_WAIT_SECONDS=1800 TIER_NIC_WAIT_SECONDS=300
-
 while [[ $# -gt 0 ]]; do
   case $1 in
     --region) require_value "$1" "${2:-}"; ZCP_REGION="$2"; shift 2 ;;
@@ -71,11 +45,9 @@ while [[ $# -gt 0 ]]; do
     *) error "Unknown argument: $1 (see --help)" ;;
   esac
 done
-
 # bash EXIT traps replace rather than stack; every file needing cleanup sets a var here instead.
 cleanup() { [ -n "${LIB_TMP:-}" ] && rm -rf "$LIB_TMP"; [ -n "${USERDATA_FILE:-}" ] && rm -f "$USERDATA_FILE"; }
 trap cleanup EXIT
-
 # A local checkout must use its OWN helpers, not main's; curl-pipe-bash has no siblings to find.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 if [ -n "${DEPLOY_LIB_DIR:-}" ]; then LIB_BASE="$DEPLOY_LIB_DIR"
@@ -90,7 +62,6 @@ for f in 01-validate.sh 02-resolve.sh 03-create.sh 04-finish.sh; do
   fi
   source "$LIB_TMP/$f"
 done
-
 validate_inputs
 resolve_resources
 create_or_adopt_vm

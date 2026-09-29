@@ -2,7 +2,6 @@ JQ_PORT_MATCH='def port_has($target): (. // "" | tostring) as $p | ($p == ($targ
 scoped_rule_exists() { zcp firewall list --ip "$1" -o json | jq -e --arg c "$MY_IP" "$JQ_PORT_MATCH"' .[] | select((.protocol|proto_is("tcp")) and (.ports|port_has(22)) and .cidr==$c)' >/dev/null 2>&1; }
 open_rule_ids() { zcp firewall list --ip "$1" -o json | jq -r "$JQ_PORT_MATCH"' .[] | select(((.protocol|proto_is("tcp")) or (.protocol|proto_is("udp"))) and (.ports|port_has(22)) and .cidr=="0.0.0.0/0") | .id'; }
 delete_rule() { zcp firewall delete "$1" --ip "$2" --yes || error "Could not delete rule '$1'. VM is billable - clean up with: $CLEANUP_HINT"; }
-
 lock_down_ssh() {
   local ip_slug="$1" label="$2" confirmed attempt id ids
   scoped_rule_exists "$ip_slug" \
@@ -10,14 +9,12 @@ lock_down_ssh() {
     || error "Could not create the scoped SSH rule for $MY_IP on '$label'. VM is billable - clean up with: $CLEANUP_HINT"
   for attempt in 1 2 3; do scoped_rule_exists "$ip_slug" && { confirmed="true"; break; }; sleep 3; done
   [ "$confirmed" = "true" ] || error "Could not confirm the scoped SSH rule on '$label'. VM is billable - clean up with: $CLEANUP_HINT"
-
   ids="$(zcp firewall list --ip "$ip_slug" -o json | jq -r --arg c "$MY_IP" \
     "$JQ_PORT_MATCH"' .[] | select((.protocol|proto_is("tcp")) and (.ports|port_has(22)) and .cidr!="0.0.0.0/0" and .cidr!=$c) | .id')"
   if [ -n "$ids" ]; then
     warn "Removing SSH rule(s) on '$label' scoped to a different IP than today's."
     while read -r id; do [ -n "$id" ] && delete_rule "$id" "$ip_slug"; done <<< "$ids"
   fi
-
   confirmed="false"
   for attempt in 1 2 3; do
     if ids="$(open_rule_ids "$ip_slug")"; then
@@ -27,14 +24,11 @@ lock_down_ssh() {
     sleep 3
   done
   [ "$confirmed" = "true" ] || error "Lockdown failed: 0.0.0.0/0 still exposes port 22 for '$label' (or the query to check kept failing). VM is billable - clean up with: $CLEANUP_HINT"
-
   confirmed="false"
   for attempt in 1 2 3; do scoped_rule_exists "$ip_slug" && { confirmed="true"; break; }; sleep 3; done
   [ "$confirmed" = "true" ] || error "Lockdown failed: scoped rule for '$label' gone after cleanup. VM is billable - clean up with: $CLEANUP_HINT"
 }
-
 ip_to_int() { local IFS=. o1 o2 o3 o4; read -r o1 o2 o3 o4 <<< "$1"; echo $(( (o1<<24)+(o2<<16)+(o3<<8)+o4 )); }
-
 setup_tier_nic() {
   step "Step 2/3: Bring up the tier network interface"
   local mask net_int ip_int start=$SECONDS
@@ -48,7 +42,6 @@ network:
       dhcp4: true
 EOF" "$VM_USER" || error "Could not write netplan on '$VM_NAME'. VM is billable - clean up with: $CLEANUP_HINT"
   remote "$VM_IP" "sudo netplan apply" "$VM_USER" || error "Could not apply netplan on '$VM_NAME'. VM is billable - clean up with: $CLEANUP_HINT"
-
   info "Waiting for '$TIER_NIC' to get its tier address..."
   VM_TIER_IP=""
   while true; do
@@ -64,7 +57,6 @@ EOF" "$VM_USER" || error "Could not write netplan on '$VM_NAME'. VM is billable 
     || error "Interface '$TIER_NIC' came up with $VM_TIER_IP, not on the tier ($TIER_CIDR). VM is billable - clean up with: $CLEANUP_HINT"
   success "Tier NIC ($TIER_NIC) up at $VM_TIER_IP"
 }
-
 wait_for_cloud_init_user() {
   step "Step 3/3: Confirm the cloud-init user exists"
   local start=$SECONDS uid
@@ -78,7 +70,6 @@ wait_for_cloud_init_user() {
     sleep 10
   done
 }
-
 print_summary() {
   step "Done"
   local pw_summary
