@@ -39,17 +39,22 @@ wait_for_ssh() {
 }
 create_or_adopt_vm() {
   step "Step 1/3: Deploy the desktop VM"
+  # zcp instance create --user-data-file always prepends its own #!/bin/bash, which pushes
+  # a #cloud-config header (and any write_files module) off line 1 and makes cloud-init run
+  # the whole payload as a failing shell script instead of parsing it. Write the deploy.env
+  # file ourselves as plain bash instead of relying on cloud-config. printf, not an unquoted
+  # heredoc, so a password containing $()/`` is never re-evaluated while building this file.
   USERDATA_FILE="$(mktemp)"; chmod 600 "$USERDATA_FILE"
-  cat > "$USERDATA_FILE" <<EOF
-#cloud-config
-write_files:
-  - path: /etc/zmi/deploy.env
-    permissions: '0600'
-    owner: root:root
-    content: |
-      UBUNTUKDE_USERNAME=$DESKTOP_USERNAME
-      UBUNTUKDE_PASSWORD=$DESKTOP_PASSWORD
-EOF
+  {
+    printf '#!/bin/bash\n'
+    printf 'mkdir -p /etc/zmi\n'
+    printf 'cat > /etc/zmi/deploy.env <<'\''ENVEOF'\''\n'
+    printf 'UBUNTUKDE_USERNAME=%s\n' "$DESKTOP_USERNAME"
+    printf 'UBUNTUKDE_PASSWORD=%s\n' "$DESKTOP_PASSWORD"
+    printf 'ENVEOF\n'
+    printf 'chmod 600 /etc/zmi/deploy.env\n'
+    printf 'chown root:root /etc/zmi/deploy.env\n'
+  } > "$USERDATA_FILE"
   if ! instance_exists "$VM_NAME"; then
     if [ "$PASSWORD_PROVIDED" = "true" ]; then
       info "Creating '$VM_NAME' with the password you passed."
