@@ -1,22 +1,9 @@
 #!/bin/bash
 # ZCP Connect Desktop to Storage
-# Mounts an existing NFS share (from the "Deploy Private Shared Storage"
-# tutorial) onto an existing desktop VM (from the "Deploy Ubuntu Employee
-# Desktops" tutorial), for one named employee login. Run by the operator over
-# SSH admin access, BEFORE handing RDP credentials to that employee.
-#
-# This configures two already-existing VMs; it does not create or delete
-# anything. There is no companion destroy script - undoing this is a single
-# 'sudo umount' on the desktop, covered as a one-liner in the tutorial doc,
-# not a script of its own.
-#
-# Everything here (install, mkdir, mount, fstab) runs as 'ubuntu', the same
-# admin SSH user every sibling script in this series relies on for
-# passwordless root sudo - no employee password is ever needed or accepted.
-# NFS file ownership comes from whoever WRITES a file, not whoever ran
-# 'mount', so the only place identity actually matters is the verification
-# write below, and that's done by switching to the employee via ubuntu's own
-# (free) sudo, not by the employee authenticating itself.
+# Mounts an existing NFS share (Deploy Private Shared Storage) onto an
+# existing desktop VM (Deploy Ubuntu Employee Desktops), for one named
+# employee login. Run by the operator over SSH, before handing RDP
+# credentials to that employee. No destroy script - undo is 'sudo umount'.
 #
 # Usage:
 #   ./connect-desktop-to-storage.sh --desktop-name my-desktop \
@@ -93,9 +80,6 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# ---------------------------------------------------------------------------
-# Step 1: Validate inputs
-# ---------------------------------------------------------------------------
 step "Validating inputs"
 
 [ -n "$DESKTOP_NAME" ] || error "--desktop-name is required."
@@ -109,17 +93,10 @@ NAME_RE='^[a-zA-Z0-9-]+$'
 OCTET='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])'
 [[ "$STORAGE_TIER_IP" =~ ^${OCTET}\.${OCTET}\.${OCTET}\.${OCTET}$ ]] || error "--storage-tier-ip '$STORAGE_TIER_IP' is not a valid IPv4 address."
 
-# Same convention as deploy-employee-desktop.sh's own username validation:
-# the account this script is about to sudo into (for the verification write
-# only - see the header comment) must match what the ubuntukde image's
-# first-boot actually accepts, not a guess.
 [[ "$DESKTOP_USERNAME" =~ ^[a-z][a-z0-9_]*$ ]] \
   || error "--username '$DESKTOP_USERNAME' must match ^[a-z][a-z0-9_]*\$."
 [ "${#DESKTOP_USERNAME}" -le 32 ] || error "--username too long (${#DESKTOP_USERNAME} chars; useradd's limit is 32)."
 
-# ---------------------------------------------------------------------------
-# Preflight
-# ---------------------------------------------------------------------------
 command -v zcp >/dev/null 2>&1 || error "zcp CLI not found."
 command -v jq >/dev/null 2>&1 || error "jq not found."
 command -v ssh >/dev/null 2>&1 || error "ssh client not found."
@@ -129,13 +106,8 @@ zcp auth validate >/dev/null 2>&1 || error "zcp CLI is not authenticated."
 export ZCP_REGION ZCP_PROJECT
 zcp() { command zcp --region "$ZCP_REGION" --project "$ZCP_PROJECT" "$@"; }
 
-# ---------------------------------------------------------------------------
-# SSH helper: retries on exit 255 (connection-level failure) only, same as
-# deploy-employee-desktop.sh's lib/remote(). Never retries a real remote
-# command failure. Everything below runs as 'ubuntu' - passwordless root
-# sudo, same as every sibling script - so no credential-priming/caching
-# helper is needed here.
-# ---------------------------------------------------------------------------
+# Retries on exit 255 (connection-level failure) only, never a real remote
+# command failure. Everything runs as 'ubuntu' - passwordless root sudo.
 remote() {
   local ip="$1" cmd="$2" user="${3:-ubuntu}" attempt status
   for attempt in 1 2 3; do
@@ -146,9 +118,6 @@ remote() {
   return "$status"
 }
 
-# ---------------------------------------------------------------------------
-# Step 2: Resolve the desktop VM's public IP
-# ---------------------------------------------------------------------------
 step "Resolving the desktop VM"
 
 VM_LIST_JSON="$(zcp instance list -o json)" || error "Could not list instances to look up '$DESKTOP_NAME'."
@@ -166,28 +135,18 @@ VM_IP="$(echo "$VM_INSTANCE_JSON" | jq -r '.[] | select(.field=="Public IP") | .
 [ -n "$VM_IP" ] && [ "$VM_IP" != "null" ] || error "Could not determine '$DESKTOP_NAME' public IP. Check manually: zcp instance get $VM_SLUG"
 success "Desktop VM '$DESKTOP_NAME' resolved, public IP: $VM_IP"
 
-# ---------------------------------------------------------------------------
-# Step 3: Confirm the employee account exists
-# ---------------------------------------------------------------------------
 step "Checking the employee account"
 
 remote "$VM_IP" "getent passwd '$DESKTOP_USERNAME' >/dev/null" "ubuntu" \
   || error "Employee account '$DESKTOP_USERNAME' not found on '$DESKTOP_NAME' (getent passwd). Deploy that account first with deploy-employee-desktop.sh --username $DESKTOP_USERNAME, then re-run this script."
 success "Employee account '$DESKTOP_USERNAME' confirmed on '$DESKTOP_NAME'."
 
-# ---------------------------------------------------------------------------
-# Step 4: Idempotency check - already mounted?
-# ---------------------------------------------------------------------------
 step "Checking whether the share is already mounted"
 
 EXPECTED_SOURCE="${STORAGE_TIER_IP}:/srv/nfs/${SHARE_NAME}"
-# --mountpoint (exact match), not --target: --target walks up to the nearest
-# ancestor mountpoint, so on a plain unmounted directory it reports the ROOT
-# DISK as the "source" instead of nothing - which would make the branch below
-# wrongly refuse to mount, mistaking an unmounted directory (e.g. right after
-# the documented 'sudo umount' undo, or a previous run that got as far as
-# mkdir but failed to mount) for a real conflicting mount. No identity switch
-# needed here either - findmnt doesn't care whose mount it is.
+# --mountpoint, not --target: --target walks up to the nearest ancestor
+# mountpoint, so a plain unmounted directory would misreport the root disk
+# as "already mounted" and wrongly refuse to proceed.
 MOUNT_CHECK_CMD="findmnt -n -o SOURCE --mountpoint=/mnt/${SHARE_NAME} 2>/dev/null || true"
 CURRENT_SOURCE="$(remote "$VM_IP" "$MOUNT_CHECK_CMD" "ubuntu")" || true
 
@@ -202,14 +161,9 @@ if [ -n "$CURRENT_SOURCE" ]; then
 fi
 
 if [ "$ALREADY_MOUNTED" != "true" ]; then
-  # -------------------------------------------------------------------------
-  # Step 5: Install nfs-common and mount, as ubuntu (passwordless root sudo)
-  # -------------------------------------------------------------------------
   step "Installing nfs-common and mounting the share"
 
-  # apt-get update is required, not optional: the ubuntukde template's build
-  # runs 'rm -rf /var/lib/apt/lists/*' during image cleanup, so an install
-  # without a prior update fails with "Unable to locate package".
+  # Required: the ubuntukde template's build strips /var/lib/apt/lists/*.
   remote "$VM_IP" "sudo apt-get update && sudo apt-get install -y nfs-common" "ubuntu" \
     || error "Could not install nfs-common on '$DESKTOP_NAME' (apt-get update/install failed). Check manually: ssh ubuntu@$VM_IP"
 
@@ -221,9 +175,6 @@ if [ "$ALREADY_MOUNTED" != "true" ]; then
 
   success "Mounted ${STORAGE_TIER_IP}:/srv/nfs/${SHARE_NAME} at /mnt/${SHARE_NAME} on '$DESKTOP_NAME'."
 
-  # -------------------------------------------------------------------------
-  # Step 6: Verify the mount actually works
-  # -------------------------------------------------------------------------
   step "Verifying the mount"
 
   DF_SOURCE="$(remote "$VM_IP" "df --output=source /mnt/${SHARE_NAME} 2>/dev/null | tail -n1" "ubuntu")" \
@@ -232,11 +183,9 @@ if [ "$ALREADY_MOUNTED" != "true" ]; then
   [ "$DF_SOURCE" = "$EXPECTED_SOURCE" ] \
     || error "Mount 'succeeded' but /mnt/${SHARE_NAME} on '$DESKTOP_NAME' is not backed by $EXPECTED_SOURCE (df shows '$DF_SOURCE' - likely still the local root disk from a merged-argument mount failure). Check manually: ssh ubuntu@$VM_IP"
 
-  # Written and read as the employee (via ubuntu's own free sudo identity
-  # switch, no password) - this is the one place identity actually matters,
-  # to prove the file lands writable/readable under that account, not just
-  # that root's mount succeeded. Name scoped to this desktop+employee so a
-  # concurrent run, or a leftover from a prior failed cleanup, can't collide.
+  # Written/read as the employee via ubuntu's own sudo -u, to prove the file
+  # lands under their UID. Filename scoped to desktop+employee to avoid
+  # collisions.
   TEST_FILE="/mnt/${SHARE_NAME}/.zcp-connect-test-${DESKTOP_NAME}-${DESKTOP_USERNAME}"
   remote "$VM_IP" "sudo -u '$DESKTOP_USERNAME' -i bash -c 'echo zcp-connect-test-ok > ${TEST_FILE}'" "ubuntu" \
     || error "Could not write a test file to /mnt/${SHARE_NAME} on '$DESKTOP_NAME' as '$DESKTOP_USERNAME' (write failed). Check share permissions."
@@ -249,19 +198,13 @@ if [ "$ALREADY_MOUNTED" != "true" ]; then
   success "Mount verified: NFS-backed, writable and readable by '$DESKTOP_USERNAME'."
 fi
 
-# ---------------------------------------------------------------------------
-# Step 7: Idempotent /etc/fstab entry
-# ---------------------------------------------------------------------------
 step "Updating /etc/fstab"
 
 FSTAB_MOUNTPOINT="/mnt/${SHARE_NAME}"
 FSTAB_LINE="${STORAGE_TIER_IP}:/srv/nfs/${SHARE_NAME} ${FSTAB_MOUNTPOINT} nfs defaults,noatime,nofail,_netdev 0 0"
 # Replaces any existing line for this mountpoint (matched by field 2, not a
-# grep -qF whole-line/substring match - a stale line from a prior run against
-# a different --storage-tier-ip, or a commented-out line that would
-# otherwise falsely count as "already present", both need real replacement,
-# not a skip). Same awk-filter-then-append idiom deploy-private-storage.sh
-# already uses for its own /etc/fstab entry.
+# whole-line/substring match), so a stale line from a different tier IP gets
+# swapped, not duplicated.
 FSTAB_CMD="set -e
 existing=\$(awk -v mp='${FSTAB_MOUNTPOINT}' '\$2==mp' /etc/fstab)
 if [ \"\$existing\" = '${FSTAB_LINE}' ]; then
@@ -282,9 +225,6 @@ case "$FSTAB_OUTPUT" in
   *) error "Unexpected output while updating /etc/fstab on '$DESKTOP_NAME': $FSTAB_OUTPUT" ;;
 esac
 
-# ---------------------------------------------------------------------------
-# Summary
-# ---------------------------------------------------------------------------
 step "Done"
 cat <<EOF
 
@@ -296,10 +236,7 @@ Shared storage connected:
   fstab        : entry present, remounts automatically on reboot
 
 Notes:
-  - NFS here enforces permissions by raw UID number, not by username. What
-    actually matters for shared-storage correctness across desktops is that
-    this employee's UID matches whatever UID the storage side expects for
-    them, not whether any one server can resolve a name for it. If your
+  - NFS here enforces permissions by raw UID number, not by username. If your
     organization needs per-employee isolation, that's a separate identity/UID
     decision to make before this employee's first login - see the identity/UID
     section of the "Deploy Ubuntu Employee Desktops" tutorial.
