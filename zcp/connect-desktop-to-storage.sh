@@ -97,6 +97,17 @@ OCTET='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])'
   || error "--username '$DESKTOP_USERNAME' must match ^[a-z][a-z0-9_]*\$."
 [ "${#DESKTOP_USERNAME}" -le 32 ] || error "--username too long (${#DESKTOP_USERNAME} chars; useradd's limit is 32)."
 
+# Same reserved list as deploy-employee-desktop.sh's own validation: real
+# accounts on the ubuntukde image, not a guess. Without this, --username
+# ubuntu or --username root would pass getent passwd trivially (they're real
+# accounts) and the script would run the verification write/read as them
+# instead of an actual employee.
+RESERVED=(ubuntu nobody root daemon bin sys sync games man lp mail news uucp proxy www-data backup list irc gnats syslog messagebus landscape xrdp sddm sshd polkitd dhcpcd uuidd tss pollinate tcpdump usbmux rtkit avahi geoclue dnsmasq)
+for r in "${RESERVED[@]}"; do
+  [ "$DESKTOP_USERNAME" != "$r" ] \
+    || error "--username '$DESKTOP_USERNAME' collides with an existing account on the image. Use the employee's actual login, not a system account."
+done
+
 command -v zcp >/dev/null 2>&1 || error "zcp CLI not found."
 command -v jq >/dev/null 2>&1 || error "jq not found."
 command -v ssh >/dev/null 2>&1 || error "ssh client not found."
@@ -154,7 +165,7 @@ ALREADY_MOUNTED="false"
 if [ -n "$CURRENT_SOURCE" ]; then
   if [ "$CURRENT_SOURCE" = "$EXPECTED_SOURCE" ]; then
     ALREADY_MOUNTED="true"
-    warn "/mnt/${SHARE_NAME} on '$DESKTOP_NAME' is already mounted from $EXPECTED_SOURCE. Skipping install/mount/verify, checking /etc/fstab only."
+    warn "/mnt/${SHARE_NAME} on '$DESKTOP_NAME' is already mounted from $EXPECTED_SOURCE. Skipping install/mount, but still re-verifying it's actually usable before touching /etc/fstab."
   else
     error "/mnt/${SHARE_NAME} on '$DESKTOP_NAME' is already mounted from '$CURRENT_SOURCE', not the expected '$EXPECTED_SOURCE'. Refusing to mount over it - something may still be using it. If this tier IP is genuinely correct (e.g. the storage VM was redeployed), unmount it yourself first: ssh ubuntu@$VM_IP 'sudo umount /mnt/${SHARE_NAME}', then re-run this script."
   fi
@@ -174,29 +185,32 @@ if [ "$ALREADY_MOUNTED" != "true" ]; then
     || error "Could not mount ${STORAGE_TIER_IP}:/srv/nfs/${SHARE_NAME} at /mnt/${SHARE_NAME} on '$DESKTOP_NAME' (mount failed - check the storage VM is reachable on the tier and is actually exporting this share). Check manually: ssh ubuntu@$VM_IP"
 
   success "Mounted ${STORAGE_TIER_IP}:/srv/nfs/${SHARE_NAME} at /mnt/${SHARE_NAME} on '$DESKTOP_NAME'."
-
-  step "Verifying the mount"
-
-  DF_SOURCE="$(remote "$VM_IP" "df --output=source /mnt/${SHARE_NAME} 2>/dev/null | tail -n1" "ubuntu")" \
-    || error "Could not read df output for /mnt/${SHARE_NAME} on '$DESKTOP_NAME' (df failed)."
-  DF_SOURCE="$(echo "$DF_SOURCE" | xargs)"
-  [ "$DF_SOURCE" = "$EXPECTED_SOURCE" ] \
-    || error "Mount 'succeeded' but /mnt/${SHARE_NAME} on '$DESKTOP_NAME' is not backed by $EXPECTED_SOURCE (df shows '$DF_SOURCE' - likely still the local root disk from a merged-argument mount failure). Check manually: ssh ubuntu@$VM_IP"
-
-  # Written/read as the employee via ubuntu's own sudo -u, to prove the file
-  # lands under their UID. Filename scoped to desktop+employee to avoid
-  # collisions.
-  TEST_FILE="/mnt/${SHARE_NAME}/.zcp-connect-test-${DESKTOP_NAME}-${DESKTOP_USERNAME}"
-  remote "$VM_IP" "sudo -u '$DESKTOP_USERNAME' -i bash -c 'echo zcp-connect-test-ok > ${TEST_FILE}'" "ubuntu" \
-    || error "Could not write a test file to /mnt/${SHARE_NAME} on '$DESKTOP_NAME' as '$DESKTOP_USERNAME' (write failed). Check share permissions."
-  READBACK="$(remote "$VM_IP" "sudo -u '$DESKTOP_USERNAME' -i bash -c 'cat ${TEST_FILE} 2>/dev/null'" "ubuntu")" \
-    || error "Could not read back the test file from /mnt/${SHARE_NAME} on '$DESKTOP_NAME' (read failed)."
-  [ "$(echo "$READBACK" | xargs)" = "zcp-connect-test-ok" ] \
-    || error "Write+read verification failed on /mnt/${SHARE_NAME} on '$DESKTOP_NAME' (expected 'zcp-connect-test-ok', got '$READBACK')."
-  remote "$VM_IP" "sudo -u '$DESKTOP_USERNAME' -i bash -c 'rm -f ${TEST_FILE}'" "ubuntu" \
-    || warn "Could not remove the verification test file ${TEST_FILE} on '$DESKTOP_NAME' (cleanup failed). Harmless, but you may want to remove it manually."
-  success "Mount verified: NFS-backed, writable and readable by '$DESKTOP_USERNAME'."
 fi
+
+# Always re-verified, even when already mounted: a mount that mounted fine
+# but failed its write/read check on a prior run must not get silently
+# persisted to fstab and reported as success just because it's still mounted.
+step "Verifying the mount"
+
+DF_SOURCE="$(remote "$VM_IP" "df --output=source /mnt/${SHARE_NAME} 2>/dev/null | tail -n1" "ubuntu")" \
+  || error "Could not read df output for /mnt/${SHARE_NAME} on '$DESKTOP_NAME' (df failed)."
+DF_SOURCE="$(echo "$DF_SOURCE" | xargs)"
+[ "$DF_SOURCE" = "$EXPECTED_SOURCE" ] \
+  || error "Mount 'succeeded' but /mnt/${SHARE_NAME} on '$DESKTOP_NAME' is not backed by $EXPECTED_SOURCE (df shows '$DF_SOURCE' - likely still the local root disk from a merged-argument mount failure). Check manually: ssh ubuntu@$VM_IP"
+
+# Written/read as the employee via ubuntu's own sudo -u, to prove the file
+# lands under their UID. Filename scoped to desktop+employee to avoid
+# collisions.
+TEST_FILE="/mnt/${SHARE_NAME}/.zcp-connect-test-${DESKTOP_NAME}-${DESKTOP_USERNAME}"
+remote "$VM_IP" "sudo -u '$DESKTOP_USERNAME' -i bash -c 'echo zcp-connect-test-ok > ${TEST_FILE}'" "ubuntu" \
+  || error "Could not write a test file to /mnt/${SHARE_NAME} on '$DESKTOP_NAME' as '$DESKTOP_USERNAME' (write failed). Check share permissions."
+READBACK="$(remote "$VM_IP" "sudo -u '$DESKTOP_USERNAME' -i bash -c 'cat ${TEST_FILE} 2>/dev/null'" "ubuntu")" \
+  || error "Could not read back the test file from /mnt/${SHARE_NAME} on '$DESKTOP_NAME' (read failed)."
+[ "$(echo "$READBACK" | xargs)" = "zcp-connect-test-ok" ] \
+  || error "Write+read verification failed on /mnt/${SHARE_NAME} on '$DESKTOP_NAME' (expected 'zcp-connect-test-ok', got '$READBACK')."
+remote "$VM_IP" "sudo -u '$DESKTOP_USERNAME' -i bash -c 'rm -f ${TEST_FILE}'" "ubuntu" \
+  || warn "Could not remove the verification test file ${TEST_FILE} on '$DESKTOP_NAME' (cleanup failed). Harmless, but you may want to remove it manually."
+success "Mount verified: NFS-backed, writable and readable by '$DESKTOP_USERNAME'."
 
 step "Updating /etc/fstab"
 
