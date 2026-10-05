@@ -2,6 +2,8 @@
 
 One-liner automation scripts for endpoint setup.
 
+See [GitHub repository management](github/README.md) for the repository creation and hardening tool.
+
 ## Ansible Dev Environment Setup
 
 Install Ansible and common automation packages once per machine. Creates a Python venv at `$HOME/.ansible-dev/venv` and auto-activates it in your shell on every new terminal.
