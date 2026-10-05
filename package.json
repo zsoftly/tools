@@ -4,7 +4,8 @@
   "description": "Automation scripts with markdown formatting",
   "scripts": {
     "fmt": "prettier --write '**/*.md'",
-    "fmt:check": "prettier --check '**/*.md'"
+    "fmt:check": "prettier --check '**/*.md'",
+    "check:repository": "node github/validate-repository-template.mjs"
   },
   "devDependencies": {
     "prettier": "^3.3.0"
