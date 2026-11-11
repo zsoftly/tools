@@ -68,9 +68,7 @@ resolve_resources() {
   VM_PLAN_CPU="$(echo "$pd" | jq -r '.cpu')"; VM_PLAN_MEMORY="$(echo "$pd" | jq -r '.memory')"
   NETWORK_PLAN="$(resolve "$NETWORK_PLAN" "network plan" "zcp plan network -o json" '.[0].slug')"
   STORAGE_CATEGORY="$(resolve "$STORAGE_CATEGORY" "storage category" "zcp storage-category list -o json" '.[0].slug')"
-  BLOCKSTORAGE_PLAN="$(zcp plan storage -o json | jq -r --arg cat "$STORAGE_CATEGORY" '.[] | select(.storage_category==$cat) | .slug' | head -1)"
-  [ -n "$BLOCKSTORAGE_PLAN" ] || error "No block storage plan found for storage category '$STORAGE_CATEGORY' (see: zcp plan storage). Pass --storage-category explicitly with a category that has a matching plan."
-  info "Resolved: tier=$TIER_NAME($TIER_CIDR) template=$VM_TEMPLATE($VM_TEMPLATE_VERSION) plan=$VM_PLAN($VM_PLAN_CPU vCPU/$VM_PLAN_MEMORY) network=$NETWORK_PLAN storage=$STORAGE_CATEGORY (plan=$BLOCKSTORAGE_PLAN) user=$DESKTOP_USERNAME"
+  info "Resolved: tier=$TIER_NAME($TIER_CIDR) template=$VM_TEMPLATE($VM_TEMPLATE_VERSION) plan=$VM_PLAN($VM_PLAN_CPU vCPU/$VM_PLAN_MEMORY) network=$NETWORK_PLAN storage=$STORAGE_CATEGORY user=$DESKTOP_USERNAME"
   if [ "$AUTO_YES" != "true" ]; then
     if instance_exists "$VM_NAME"; then
       if [ "$ADOPT_EXISTING" != "true" ]; then
