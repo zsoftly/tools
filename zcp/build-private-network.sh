@@ -198,6 +198,8 @@ NETWORK_PLAN="$(resolve "$NETWORK_PLAN" "network plan" "zcp plan network -o json
 ROUTER_VPC_PLAN="$(resolve "$ROUTER_VPC_PLAN" "VPC router plan" "zcp plan router -o json" '.[0].slug')"
 STORAGE_CATEGORY_VPC="$(resolve "$STORAGE_CATEGORY_VPC" "VPC storage category" "zcp storage-category list -o json" '.[0].slug')"
 STORAGE_CATEGORY_VM="$(resolve "$STORAGE_CATEGORY_VM" "VM storage category" "zcp storage-category list -o json" '.[0].slug')"
+BLOCKSTORAGE_PLAN_VM="$(zcp plan storage -o json | jq -r --arg cat "$STORAGE_CATEGORY_VM" '.[] | select(.storage_category==$cat) | .slug' | head -1)"
+[ -n "$BLOCKSTORAGE_PLAN_VM" ] || error "No block storage plan found for storage category '$STORAGE_CATEGORY_VM' (see: zcp plan storage). Pass --vm-storage-category explicitly with a category that has a matching plan."
 
 info "Resolved resources:"
 echo "    Headplane template   : $HEADPLANE_TEMPLATE" >&2
@@ -208,6 +210,7 @@ echo "    Network plan         : $NETWORK_PLAN" >&2
 echo "    VPC router plan      : $ROUTER_VPC_PLAN" >&2
 echo "    VPC storage category : $STORAGE_CATEGORY_VPC" >&2
 echo "    VM storage category  : $STORAGE_CATEGORY_VM" >&2
+echo "    VM block storage plan: $BLOCKSTORAGE_PLAN_VM" >&2
 
 if [ "$AUTO_YES" != "true" ]; then
   echo "" >&2
@@ -509,7 +512,6 @@ success "ACL applied to '$TIER_NAME'. This is what makes the tier private, not t
 step "Step 7/8: Deploy Headplane"
 
 if ! instance_exists "$HEADSCALE_NAME"; then
-  BLOCKSTORAGE_PLAN_VM="$(zcp plan storage -o json | jq -r --arg cat "$STORAGE_CATEGORY_VM" '.[] | select(.storage_category==$cat) | .slug' | head -1)"
   zcp instance create --name "$HEADSCALE_NAME" \
     --template "$HEADPLANE_TEMPLATE" --plan "$HEADPLANE_PLAN" \
     --billing-cycle "$BILLING_CYCLE" --network-plan "$NETWORK_PLAN" \
@@ -636,7 +638,6 @@ info "API key (also saved on the VM at /etc/headplane/credentials.txt): $HEADPLA
 step "Step 8/8: Deploy the subnet router and enroll it in the mesh"
 
 if ! instance_exists "$ROUTER_NAME"; then
-  BLOCKSTORAGE_PLAN_VM="$(zcp plan storage -o json | jq -r --arg cat "$STORAGE_CATEGORY_VM" '.[] | select(.storage_category==$cat) | .slug' | head -1)"
   zcp instance create --name "$ROUTER_NAME" \
     --template "$ROUTER_TEMPLATE" --plan "$ROUTER_PLAN" --billing-cycle "$BILLING_CYCLE" \
     --network-plan "$NETWORK_PLAN" --storage-category "$STORAGE_CATEGORY_VM" \
