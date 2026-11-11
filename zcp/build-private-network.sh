@@ -509,10 +509,12 @@ success "ACL applied to '$TIER_NAME'. This is what makes the tier private, not t
 step "Step 7/8: Deploy Headplane"
 
 if ! instance_exists "$HEADSCALE_NAME"; then
+  BLOCKSTORAGE_PLAN_VM="$(zcp plan storage -o json | jq -r --arg cat "$STORAGE_CATEGORY_VM" '.[] | select(.storage_category==$cat) | .slug' | head -1)"
   zcp instance create --name "$HEADSCALE_NAME" \
     --template "$HEADPLANE_TEMPLATE" --plan "$HEADPLANE_PLAN" \
     --billing-cycle "$BILLING_CYCLE" --network-plan "$NETWORK_PLAN" \
-    --storage-category "$STORAGE_CATEGORY_VM" --ssh-key "$SSH_KEY" --wait
+    --storage-category "$STORAGE_CATEGORY_VM" --blockstorage-plan "$BLOCKSTORAGE_PLAN_VM" --root-disk-size 40 \
+    --ssh-key "$SSH_KEY" --wait
   success "'$HEADSCALE_NAME' created"
 else
   warn "'$HEADSCALE_NAME' already exists, skipping creation."
@@ -634,9 +636,11 @@ info "API key (also saved on the VM at /etc/headplane/credentials.txt): $HEADPLA
 step "Step 8/8: Deploy the subnet router and enroll it in the mesh"
 
 if ! instance_exists "$ROUTER_NAME"; then
+  BLOCKSTORAGE_PLAN_VM="$(zcp plan storage -o json | jq -r --arg cat "$STORAGE_CATEGORY_VM" '.[] | select(.storage_category==$cat) | .slug' | head -1)"
   zcp instance create --name "$ROUTER_NAME" \
     --template "$ROUTER_TEMPLATE" --plan "$ROUTER_PLAN" --billing-cycle "$BILLING_CYCLE" \
     --network-plan "$NETWORK_PLAN" --storage-category "$STORAGE_CATEGORY_VM" \
+    --blockstorage-plan "$BLOCKSTORAGE_PLAN_VM" --root-disk-size 40 \
     --ssh-key "$SSH_KEY" --wait
   success "'$ROUTER_NAME' created"
 else
