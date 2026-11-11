@@ -63,7 +63,8 @@ create_or_adopt_vm() {
     fi
     zcp instance create --name "$VM_NAME" --template "$VM_TEMPLATE" --plan "$VM_PLAN" \
         --billing-cycle "$BILLING_CYCLE" --network-plan "$NETWORK_PLAN" \
-        --storage-category "$STORAGE_CATEGORY" --ssh-key "$SSH_KEY" \
+        --storage-category "$STORAGE_CATEGORY" --blockstorage-plan "$BLOCKSTORAGE_PLAN" --root-disk-size 40 \
+        --ssh-key "$SSH_KEY" \
         --user-data-file "$USERDATA_FILE" --wait \
       || error "Could not create '$VM_NAME'. If created anyway, its password is printed above. Clean up with: $CLEANUP_HINT"
     success "'$VM_NAME' created"
