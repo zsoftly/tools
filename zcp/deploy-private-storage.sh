@@ -388,9 +388,12 @@ step "Step 1/4: Deploy the storage VM"
 # own IP, and NFS is never opened on the public side at all, so the VM ends
 # up just as unreachable for NFS as a no-public-IP VM would be.
 if ! instance_exists "$VM_NAME"; then
+  BLOCKSTORAGE_PLAN_VM="$(zcp plan storage -o json | jq -r --arg cat "$VM_STORAGE_CATEGORY" '.[] | select(.storage_category==$cat) | .slug' | head -1)"
+  [ -n "$BLOCKSTORAGE_PLAN_VM" ] && [ "$BLOCKSTORAGE_PLAN_VM" != "null" ] || error "No block storage plan found for storage category '$VM_STORAGE_CATEGORY' (see: zcp plan storage). Pass --vm-storage-category explicitly with a category that has a matching plan."
   zcp instance create --name "$VM_NAME" \
     --template "$VM_TEMPLATE" --plan "$VM_PLAN" --billing-cycle "$BILLING_CYCLE" \
     --network-plan "$NETWORK_PLAN" --storage-category "$VM_STORAGE_CATEGORY" \
+    --blockstorage-plan "$BLOCKSTORAGE_PLAN_VM" --root-disk-size 40 \
     --ssh-key "$SSH_KEY" --wait
   success "'$VM_NAME' created"
 else

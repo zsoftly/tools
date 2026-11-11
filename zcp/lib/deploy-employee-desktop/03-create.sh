@@ -61,9 +61,12 @@ create_or_adopt_vm() {
     else
       warn "Creating '$VM_NAME' with a generated password. SAVE THIS NOW: $DESKTOP_PASSWORD"
     fi
+    BLOCKSTORAGE_PLAN="$(zcp plan storage -o json | jq -r --arg cat "$STORAGE_CATEGORY" '.[] | select(.storage_category==$cat) | .slug' | head -1)"
+    [ -n "$BLOCKSTORAGE_PLAN" ] && [ "$BLOCKSTORAGE_PLAN" != "null" ] || error "No block storage plan found for storage category '$STORAGE_CATEGORY' (see: zcp plan storage). Pass --storage-category explicitly with a category that has a matching plan."
     zcp instance create --name "$VM_NAME" --template "$VM_TEMPLATE" --plan "$VM_PLAN" \
         --billing-cycle "$BILLING_CYCLE" --network-plan "$NETWORK_PLAN" \
-        --storage-category "$STORAGE_CATEGORY" --ssh-key "$SSH_KEY" \
+        --storage-category "$STORAGE_CATEGORY" --blockstorage-plan "$BLOCKSTORAGE_PLAN" --root-disk-size 40 \
+        --ssh-key "$SSH_KEY" \
         --user-data-file "$USERDATA_FILE" --wait \
       || error "Could not create '$VM_NAME'. If created anyway, its password is printed above. Clean up with: $CLEANUP_HINT"
     success "'$VM_NAME' created"

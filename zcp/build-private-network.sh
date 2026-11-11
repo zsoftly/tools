@@ -199,6 +199,16 @@ ROUTER_VPC_PLAN="$(resolve "$ROUTER_VPC_PLAN" "VPC router plan" "zcp plan router
 STORAGE_CATEGORY_VPC="$(resolve "$STORAGE_CATEGORY_VPC" "VPC storage category" "zcp storage-category list -o json" '.[0].slug')"
 STORAGE_CATEGORY_VM="$(resolve "$STORAGE_CATEGORY_VM" "VM storage category" "zcp storage-category list -o json" '.[0].slug')"
 
+# Resolved lazily, only if a VM actually needs creating (see resolve_blockstorage_plan_vm
+# below) — unlike the lookups above, this one shouldn't block a re-run where both VMs
+# already exist, or where the plan is no longer offered but nothing needs to be created.
+BLOCKSTORAGE_PLAN_VM=""
+resolve_blockstorage_plan_vm() {
+  [ -n "$BLOCKSTORAGE_PLAN_VM" ] && return
+  BLOCKSTORAGE_PLAN_VM="$(zcp plan storage -o json | jq -r --arg cat "$STORAGE_CATEGORY_VM" '.[] | select(.storage_category==$cat) | .slug' | head -1)"
+  [ -n "$BLOCKSTORAGE_PLAN_VM" ] && [ "$BLOCKSTORAGE_PLAN_VM" != "null" ] || error "No block storage plan found for storage category '$STORAGE_CATEGORY_VM' (see: zcp plan storage). Pass --vm-storage-category explicitly with a category that has a matching plan."
+}
+
 info "Resolved resources:"
 echo "    Headplane template   : $HEADPLANE_TEMPLATE" >&2
 echo "    Headplane plan       : $HEADPLANE_PLAN" >&2
@@ -509,10 +519,12 @@ success "ACL applied to '$TIER_NAME'. This is what makes the tier private, not t
 step "Step 7/8: Deploy Headplane"
 
 if ! instance_exists "$HEADSCALE_NAME"; then
+  resolve_blockstorage_plan_vm
   zcp instance create --name "$HEADSCALE_NAME" \
     --template "$HEADPLANE_TEMPLATE" --plan "$HEADPLANE_PLAN" \
     --billing-cycle "$BILLING_CYCLE" --network-plan "$NETWORK_PLAN" \
-    --storage-category "$STORAGE_CATEGORY_VM" --ssh-key "$SSH_KEY" --wait
+    --storage-category "$STORAGE_CATEGORY_VM" --blockstorage-plan "$BLOCKSTORAGE_PLAN_VM" --root-disk-size 40 \
+    --ssh-key "$SSH_KEY" --wait
   success "'$HEADSCALE_NAME' created"
 else
   warn "'$HEADSCALE_NAME' already exists, skipping creation."
@@ -634,9 +646,11 @@ info "API key (also saved on the VM at /etc/headplane/credentials.txt): $HEADPLA
 step "Step 8/8: Deploy the subnet router and enroll it in the mesh"
 
 if ! instance_exists "$ROUTER_NAME"; then
+  resolve_blockstorage_plan_vm
   zcp instance create --name "$ROUTER_NAME" \
     --template "$ROUTER_TEMPLATE" --plan "$ROUTER_PLAN" --billing-cycle "$BILLING_CYCLE" \
     --network-plan "$NETWORK_PLAN" --storage-category "$STORAGE_CATEGORY_VM" \
+    --blockstorage-plan "$BLOCKSTORAGE_PLAN_VM" --root-disk-size 40 \
     --ssh-key "$SSH_KEY" --wait
   success "'$ROUTER_NAME' created"
 else
