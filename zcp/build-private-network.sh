@@ -206,7 +206,7 @@ BLOCKSTORAGE_PLAN_VM=""
 resolve_blockstorage_plan_vm() {
   [ -n "$BLOCKSTORAGE_PLAN_VM" ] && return
   BLOCKSTORAGE_PLAN_VM="$(zcp plan storage -o json | jq -r --arg cat "$STORAGE_CATEGORY_VM" '.[] | select(.storage_category==$cat) | .slug' | head -1)"
-  [ -n "$BLOCKSTORAGE_PLAN_VM" ] || error "No block storage plan found for storage category '$STORAGE_CATEGORY_VM' (see: zcp plan storage). Pass --vm-storage-category explicitly with a category that has a matching plan."
+  [ -n "$BLOCKSTORAGE_PLAN_VM" ] && [ "$BLOCKSTORAGE_PLAN_VM" != "null" ] || error "No block storage plan found for storage category '$STORAGE_CATEGORY_VM' (see: zcp plan storage). Pass --vm-storage-category explicitly with a category that has a matching plan."
 }
 
 info "Resolved resources:"
